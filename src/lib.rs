@@ -122,7 +122,7 @@ pub mod rdata;
 pub mod resolv;
 pub mod sign;
 pub mod test;
-pub mod transport;
+pub mod net;
 pub mod tsig;
 pub mod utils;
 pub mod validate;

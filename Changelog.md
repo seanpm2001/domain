@@ -20,7 +20,6 @@ Other changes
 [#174]: https://github.com/NLnetLabs/domain/pull/174
 [#214]: https://github.com/NLnetLabs/domain/pull/214
 
-
 ## 0.8.0
 
 Breaking Changes

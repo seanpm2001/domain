@@ -127,6 +127,7 @@ extern crate std;
 extern crate core;
 
 pub mod base;
+pub mod net;
 pub mod rdata;
 pub mod resolv;
 pub mod serve;

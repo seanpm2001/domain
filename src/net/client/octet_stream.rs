@@ -1025,7 +1025,7 @@ fn add_tcp_keepalive<Octs: Clone + Composer + OctetsBuilder>(
                     {
                         let option = option.unwrap();
                         if let AllOptData::TcpKeepalive(_) = option {
-                            panic!("handle keepalive");
+                            // Ignore existing TcpKEepalive
                         } else {
                             newopt.push(&option).unwrap();
                         }

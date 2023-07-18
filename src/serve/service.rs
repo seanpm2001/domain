@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use futures::{Future, Stream};
 
-use crate::base::octets::OctetsBuilder;
+use octseq::OctetsBuilder;
 use crate::base::{Message, StreamTarget};
 
 //------------ Service -------------------------------------------------------

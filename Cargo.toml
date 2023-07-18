@@ -62,19 +62,13 @@ zonefile    = ["bytes", "std"]
 ci-test     = ["resolv", "resolv-sync", "sign", "std", "serde", "tsig", "validate", "zonefile"]
 
 [dev-dependencies]
-<<<<<<< HEAD
-serde_test       = "1.0.130"
-serde_yaml       = "0.9"
-tokio            = { version = "1", features = ["rt-multi-thread", "io-util", "net", "test-util"] }
-tokio-native-tls = "0.3"
-=======
 rustls             = { version = "0" }
 serde_test         = "1.0.130"
 serde_yaml         = "0.9"
-tokio              = { version = "1", features = ["rt-multi-thread", "io-util", "net"] }
+tokio            = { version = "1", features = ["rt-multi-thread", "io-util", "net", "test-util"] }
+tokio-native-tls = "0.3"
 tokio-rustls       = { version = "0" }
 webpki-roots       = { version = "0" }
->>>>>>> transport
 
 [package.metadata.docs.rs]
 all-features = true
@@ -100,20 +94,10 @@ required-features = ["resolv-sync"]
 name = "client"
 required-features = ["std", "rand"]
 
-<<<<<<< HEAD
-name = "serve"
-<<<<<<< HEAD
-required-features = ["serve", "tokio-tfo"]
-=======
-required-features = ["serve", "tokio-tfo", "tokio-rustls", "rustls-pemfile"]
->>>>>>> fc7f118 (Cleanup, add TLS support.)
-=======
 [[example]]
-name = "tcp-client"
-required-features = ["net"]
+name = "serve"
+required-features = ["serve", "tokio-tfo", "tokio-rustls", "rustls-pemfile"]
 
 [[example]]
 name = "tls-client"
 required-features = ["net"]
-
->>>>>>> transport

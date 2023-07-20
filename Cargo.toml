@@ -32,7 +32,7 @@ siphasher      = { version = "0.3.10", optional = true }
 smallvec       = { version = "1.3", optional = true }
 tokio          = { version = "1.0", optional = true, features = ["io-util", "macros", "net", "time", "sync", "rt-multi-thread" ] }
 tokio-tfo      = { version = "0.2.0", optional = true }
-tokio-rustls   = { version = "0.23.4", optional = true }
+tokio-rustls   = { version = "0", optional = true }
 rustls-pemfile = { version = "1.0", optional = true }
 
 [target.'cfg(macos)'.dependencies]
@@ -62,7 +62,8 @@ zonefile    = ["bytes", "std"]
 ci-test     = ["resolv", "resolv-sync", "sign", "std", "serde", "tsig", "validate", "zonefile"]
 
 [dev-dependencies]
-rustls             = { version = "0" }
+clap       = { version = "4", features = ["derive"] }
+rustls             = { version = "0.20.8" }
 serde_test         = "1.0.130"
 serde_yaml         = "0.9"
 tokio            = { version = "1", features = ["rt-multi-thread", "io-util", "net", "test-util"] }
@@ -101,3 +102,7 @@ required-features = ["serve", "tokio-tfo", "tokio-rustls", "rustls-pemfile"]
 [[example]]
 name = "tls-client"
 required-features = ["net"]
+
+[[example]]
+name = "simple-proxy"
+required-features = ["net", "serve"]

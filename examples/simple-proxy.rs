@@ -11,6 +11,7 @@ use domain::base::{
     Message, MessageBuilder, ParsedDname, StaticCompressor, StreamTarget,
 };
 use domain::net::client::multi_stream;
+use domain::net::client::query::{GetResult, QueryMessage};
 use domain::net::client::tcp_factory::TcpConnFactory;
 use domain::net::client::tls_factory::TlsConnFactory;
 use domain::net::client::udp_tcp;

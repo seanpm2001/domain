@@ -1,6 +1,6 @@
 [package]
 name = "domain"
-version = "0.8.1-dev"
+version = "0.8.2-dev"
 rust-version = "1.65.0"
 edition = "2021"
 authors = ["Martin Hoffmann <martin@nlnetlabs.nl>"]
@@ -100,13 +100,8 @@ name = "serve"
 required-features = ["serve", "tokio-tfo", "tokio-rustls", "rustls-pemfile"]
 
 [[example]]
-name = "tcp-client"
-required-features = ["net"]
-
-[[example]]
-name = "tls-client"
-required-features = ["net"]
-
-[[example]]
 name = "simple-proxy"
 required-features = ["net", "serve"]
+
+name = "client-transports"
+required-features = ["net"]

@@ -1,12 +1,4 @@
 //! A DNS over octet stream transport
-//! # Example with TCP connection to port 53
-//! ```
-#![doc = include_str!("../../../examples/tcp-client.rs")]
-//! ```
-//! # Example with TLS connection to port 853
-//! ```
-#![doc = include_str!("../../../examples/tls-client.rs")]
-//! ```
 
 #![warn(missing_docs)]
 #![warn(clippy::missing_docs_in_private_items)]
@@ -132,6 +124,7 @@ pub struct Connection<Octs: OctetsBuilder> {
 }
 
 /// Status of a query. Used in [Query].
+#[derive(Debug)]
 enum QueryState {
     /// A request is in progress.
     ///
@@ -143,6 +136,7 @@ enum QueryState {
 }
 
 /// This struct represent an active DNS query.
+#[derive(Debug)]
 pub struct Query {
     /// Request message.
     ///
@@ -157,6 +151,7 @@ pub struct Query {
 /// This represents that state of an active DNS query if there is no need
 /// to check that the reply matches the request. The assumption is that the
 /// caller will do this check.
+#[derive(Debug)]
 pub struct QueryNoCheck {
     /// Current state of the query.
     state: QueryState,

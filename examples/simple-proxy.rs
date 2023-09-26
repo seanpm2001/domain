@@ -7,13 +7,16 @@ use clap::Parser;
 use domain::base::iana::Rtype;
 use domain::base::message_builder::PushError;
 use domain::base::opt::{Opt, OptRecord};
+use domain::base::wire::Composer;
 use domain::base::{
     Message, MessageBuilder, ParsedDname, StaticCompressor, StreamTarget,
 };
 use domain::net::client::multi_stream;
-use domain::net::client::query::{GetResult, QueryMessage};
+use domain::net::client::query::QueryMessage2;
+use domain::net::client::redundant;
 use domain::net::client::tcp_factory::TcpConnFactory;
 use domain::net::client::tls_factory::TlsConnFactory;
+use domain::net::client::udp;
 use domain::net::client::udp_tcp;
 use domain::rdata::AllRecordData;
 use domain::serve::buf::BufSource;
@@ -22,44 +25,114 @@ use domain::serve::service::{
     CallResult, Service, ServiceError, Transaction,
 };
 use futures::Stream;
+use futures::{future::BoxFuture, FutureExt};
 use octseq::octets::OctetsFrom;
 use octseq::Octets;
 use rustls::ClientConfig;
+use serde::Deserialize;
+use serde::Serialize;
+use std::fmt::Debug;
+use std::fs::File;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::net::UdpSocket;
+use tokio::task::JoinHandle;
 
 /// Arguments parser.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// IP address of remote server.
-    #[arg(short = 's', long, value_name = "IP_ADDRESS")]
-    server: Option<IpAddr>,
-
-    /// Option for the destination TCP port.
-    #[arg(short = 'p', long = "port", value_parser = clap::value_parser!(u16))]
-    port: Option<u16>,
-
     /// Option for the local port.
     #[arg(long = "locport", value_parser = clap::value_parser!(u16))]
     locport: Option<u16>,
 
-    /// Argument to enable TLS upstream connections.
-    #[arg(long = "tls", requires = "tls-params-group")]
-    do_tls: bool,
+    config: String,
+}
 
-    /// Server name for TLS.
-    #[arg(long = "servername", group = "tls-params-group")]
-    servername: Option<String>,
+/// Top level configuration structure.
+#[derive(Debug, Deserialize, Serialize)]
+struct Config {
+    /// Config for upstream connections
+    upstream: TransportConfig,
+}
 
-    /// Flag to use UDP+TCP for upstream connections.
-    #[arg(long = "udp")]
-    do_udp: bool,
+/// Configure for client transports
+#[derive(Debug, Deserialize, Serialize)]
+enum TransportConfig {
+    /// Redudant upstreams
+    #[serde(rename = "redundant")]
+    Redundant(RedundantConfig),
+
+    /// TCP upstream
+    #[serde(rename = "TCP")]
+    Tcp(TcpConfig),
+
+    /// TLS upstream
+    #[serde(rename = "TLS")]
+    Tls(TlsConfig),
+
+    /// UDP upstream that does not switch to TCP when the reply is truncated
+    #[serde(rename = "UDP-only")]
+    Udp(UdpConfig),
+
+    /// UDP upstream that switchs to TCP when the reply is truncated
+    #[serde(rename = "UDP")]
+    UdpTcp(UdpTcpConfig),
+}
+
+/// Config for a redundant transport
+#[derive(Debug, Deserialize, Serialize)]
+struct RedundantConfig {
+    /// List of transports to be used by a redundant transport
+    transports: Vec<TransportConfig>,
+}
+
+/// Config for a TCP transport
+#[derive(Debug, Deserialize, Serialize)]
+struct TcpConfig {
+    /// Address of the remote resolver
+    addr: String,
+
+    /// Optional port
+    port: Option<String>,
+}
+
+/// Config for a TLS transport
+#[derive(Debug, Deserialize, Serialize)]
+struct TlsConfig {
+    /// Name of the remote resolver
+    servername: String,
+
+    /// Address of the remote resolver
+    addr: String,
+
+    /// Optional port
+    port: Option<String>,
+}
+
+/// Config for a UDP-only transport
+#[derive(Debug, Deserialize, Serialize)]
+struct UdpConfig {
+    /// Address of the remote resolver
+    addr: String,
+
+    /// Optional port
+    port: Option<String>,
+}
+
+/// Config for a UDP+TCP transport
+#[derive(Debug, Deserialize, Serialize)]
+struct UdpTcpConfig {
+    /// Address of the remote resolver
+    addr: String,
+
+    /// Optional port
+    port: Option<String>,
 }
 
 /// Convert a Message into a MessageBuilder.
@@ -156,15 +229,13 @@ fn to_stream_target<Octs1: Octets, OctsOut>(
     Ok(builder.as_target().as_target().clone())
 }
 
-// We need a query trait to merge these into one service function.
-
 /// Function that returns a Service trait.
 ///
 /// This is a trick to capture the Future by an async block into a type.
-fn stream_service<
+fn query_service<
     RequestOctets: AsRef<[u8]> + Octets + Send + Sync + 'static,
 >(
-    conn: multi_stream::Connection<Vec<u8>>,
+    conn: impl QueryMessage2<Vec<u8>> + Clone + Send + Sync + 'static,
 ) -> impl Service<RequestOctets>
 where
     for<'a> &'a RequestOctets: AsRef<[u8]>,
@@ -172,7 +243,7 @@ where
     /// Basic query function for Service.
     fn query<RequestOctets: AsRef<[u8]> + Octets, ReplyOcts>(
         message: Message<RequestOctets>,
-        conn: multi_stream::Connection<Vec<u8>>,
+        conn: impl QueryMessage2<Vec<u8>> + Send + Sync,
     ) -> Transaction<
         impl Future<Output = Result<CallResult<Vec<u8>>, ServiceError<()>>>,
         impl Stream<Item = Result<CallResult<Vec<u8>>, ServiceError<()>>>,
@@ -206,12 +277,11 @@ where
     move |message| Ok(query::<RequestOctets, Vec<u8>>(message, conn.clone()))
 }
 
+/*
 /// Function that returns a Service trait.
 ///
 /// This is a trick to capture the Future by an async block into a type.
-fn udptcp_service<
-    RequestOctets: AsRef<[u8]> + Octets + Send + Sync + 'static,
->(
+fn udptcp_service<RequestOctets: AsRef<[u8]> + Octets + Send + Sync + 'static>(
     conn: udp_tcp::Connection<Vec<u8>>,
 ) -> impl Service<RequestOctets>
 where
@@ -253,6 +323,7 @@ where
 
     move |message| Ok(query::<RequestOctets, Vec<u8>>(message, conn.clone()))
 }
+*/
 
 /// Dummy stream
 struct NoStream<Octs> {
@@ -304,107 +375,202 @@ impl Future for VecSingle {
 async fn main() {
     let args = Args::parse();
 
-    let server = args.server.unwrap_or_else(|| "9.9.9.9".parse().unwrap());
+    let conf = Config {
+        upstream: TransportConfig::Redundant(RedundantConfig {
+            transports: vec![TransportConfig::Udp(UdpConfig {
+                addr: "::1".to_owned(),
+                port: None,
+            })],
+        }),
+    };
+    let str = serde_json::to_string(&conf).unwrap();
+    println!("got {}", str);
+
+    let f = File::open(args.config).unwrap();
+    let conf: Config = serde_json::from_reader(f).unwrap();
+
+    println!("Got: {:?}", conf);
 
     let locport = args.locport.unwrap_or_else(|| "8053".parse().unwrap());
+    let buf_source = Arc::new(VecBufSource);
+    let udpsocket2 =
+        UdpSocket::bind(SocketAddr::new("::1".parse().unwrap(), locport))
+            .await
+            .unwrap();
 
-    let udpsocket = UdpSocket::bind(SocketAddr::new(
-        "127.0.0.1".parse().unwrap(),
-        locport,
-    ))
-    .await
-    .unwrap();
+    // We cannot use get_transport because we cannot pass a Box<dyn ...> to
+    // query_service because it lacks Clone.
+    let udp_join_handle = match conf.upstream {
+        TransportConfig::Redundant(redun_conf) => {
+            let redun = get_redun::<Vec<u8>>(redun_conf).await;
+            start_service(redun, udpsocket2, buf_source)
+        }
+        TransportConfig::Tcp(tcp_conf) => {
+            let tcp = get_tcp::<Vec<u8>>(tcp_conf);
+            start_service(tcp, udpsocket2, buf_source)
+        }
+        TransportConfig::Tls(tls_conf) => {
+            let tls = get_tls::<Vec<u8>>(tls_conf);
+            start_service(tls, udpsocket2, buf_source)
+        }
+        TransportConfig::Udp(udp_conf) => {
+            let udp = get_udp::<Vec<u8>>(udp_conf);
+            start_service(udp, udpsocket2, buf_source)
+        }
+        TransportConfig::UdpTcp(udptcp_conf) => {
+            let udptcp = get_udptcp::<Vec<u8>>(udptcp_conf);
+            start_service(udptcp, udpsocket2, buf_source)
+        }
+    };
 
-    if args.do_udp {
-        let port = args.port.unwrap_or_else(|| "53".parse().unwrap());
+    udp_join_handle.await.unwrap().unwrap();
+}
 
-        let conn =
-            udp_tcp::Connection::new(SocketAddr::new(server, port)).unwrap();
-        let conn_run = conn.clone();
-
-        tokio::spawn(async move {
-            conn_run.run().await;
-            println!("run terminated");
-        });
-
-        let svc = udptcp_service(conn);
-
-        let buf_source = Arc::new(VecBufSource);
-        let srv = Arc::new(DgramServer::new(
-            udpsocket,
-            buf_source.clone(),
-            Arc::new(svc),
-        ));
-        let udp_join_handle = tokio::spawn(srv.run());
-
-        udp_join_handle.await.unwrap().unwrap();
-    } else if args.do_tls {
-        let port = args.port.unwrap_or_else(|| "853".parse().unwrap());
-
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.add_server_trust_anchors(
-            webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
-                rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
-                    ta.subject,
-                    ta.spki,
-                    ta.name_constraints,
-                )
-            }),
-        );
-        let client_config = Arc::new(
-            ClientConfig::builder()
-                .with_safe_defaults()
-                .with_root_certificates(root_store)
-                .with_no_client_auth(),
-        );
-
-        let tls_factory = TlsConnFactory::new(
-            client_config,
-            &args.servername.unwrap(),
-            SocketAddr::new(server, port),
-        );
-
-        let conn = multi_stream::Connection::new().unwrap();
-        let conn_run = conn.clone();
-
-        tokio::spawn(async move {
-            conn_run.run(tls_factory).await;
-            println!("run terminated");
-        });
-
-        let svc = stream_service(conn);
-
-        let buf_source = Arc::new(VecBufSource);
-        let srv = Arc::new(DgramServer::new(
-            udpsocket,
-            buf_source.clone(),
-            Arc::new(svc),
-        ));
-        let udp_join_handle = tokio::spawn(srv.run());
-
-        udp_join_handle.await.unwrap().unwrap();
-    } else {
-        let port = args.port.unwrap_or_else(|| "53".parse().unwrap());
-        let tcp_factory = TcpConnFactory::new(SocketAddr::new(server, port));
-
-        let conn = multi_stream::Connection::new().unwrap();
-        let conn_run = conn.clone();
-
-        tokio::spawn(async move {
-            conn_run.run(tcp_factory).await;
-            println!("run terminated");
-        });
-
-        let svc = stream_service(conn);
-
-        let buf_source = Arc::new(VecBufSource);
-        let srv = Arc::new(DgramServer::new(
-            udpsocket,
-            buf_source.clone(),
-            Arc::new(svc),
-        ));
-        let udp_join_handle = tokio::spawn(srv.run());
-
-        udp_join_handle.await.unwrap().unwrap();
+/// Get a redundant transport based on its config
+async fn get_redun<Octs: Clone + Composer + Debug + Send + Sync + 'static>(
+    config: RedundantConfig,
+) -> redundant::Connection<Octs> {
+    println!("Creating new redundant::Connection");
+    let redun = redundant::Connection::<Octs>::new().unwrap();
+    let redun_run = redun.clone();
+    tokio::spawn(async move {
+        redun_run.run().await;
+    });
+    println!("Adding to redundant::Connection");
+    for e in config.transports {
+        println!("Add to redundant::Connection");
+        redun.add(get_transport(e).await).await;
+        println!("After Add to redundant::Connection");
     }
+    redun
+}
+
+/// Get a TCP transport based on its config
+fn get_tcp<Octs: Clone + Composer + Debug + Send + Sync + 'static>(
+    config: TcpConfig,
+) -> impl QueryMessage2<Octs> + Clone + Send + Sync {
+    let sockaddr = get_sockaddr(&config.addr, config.port.as_deref(), 53);
+    let tcp_factory = TcpConnFactory::new(sockaddr);
+
+    let conn = multi_stream::Connection::new().unwrap();
+    let conn_run = conn.clone();
+
+    tokio::spawn(async move {
+        conn_run.run(tcp_factory).await;
+        println!("run terminated");
+    });
+
+    conn
+}
+
+/// Get a TLS transport based on its config
+fn get_tls<Octs: Clone + Composer + Debug + Send + Sync + 'static>(
+    config: TlsConfig,
+) -> impl QueryMessage2<Octs> + Clone + Send + Sync {
+    let sockaddr = get_sockaddr(&config.addr, config.port.as_deref(), 853);
+
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(
+        |ta| {
+            rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
+                ta.subject,
+                ta.spki,
+                ta.name_constraints,
+            )
+        },
+    ));
+    let client_config = Arc::new(
+        ClientConfig::builder()
+            .with_safe_defaults()
+            .with_root_certificates(root_store)
+            .with_no_client_auth(),
+    );
+
+    let tls_factory =
+        TlsConnFactory::new(client_config, &config.servername, sockaddr);
+
+    let conn = multi_stream::Connection::new().unwrap();
+    let conn_run = conn.clone();
+
+    tokio::spawn(async move {
+        conn_run.run(tls_factory).await;
+        println!("run terminated");
+    });
+
+    conn
+}
+
+/// Get a UDP-only transport based on its config
+fn get_udp<Octs: Clone + Composer + Debug + Send + Sync + 'static>(
+    config: UdpConfig,
+) -> impl QueryMessage2<Octs> + Clone + Send + Sync {
+    let sockaddr = get_sockaddr(&config.addr, config.port.as_deref(), 53);
+
+    udp::Connection::new(sockaddr).unwrap()
+}
+
+/// Get a UDP+TCP transport based on its config
+fn get_udptcp<Octs: Clone + Composer + Debug + Send + Sync + 'static>(
+    config: UdpTcpConfig,
+) -> impl QueryMessage2<Octs> + Clone + Send + Sync {
+    let sockaddr = get_sockaddr(&config.addr, config.port.as_deref(), 53);
+    let conn = udp_tcp::Connection::new(sockaddr).unwrap();
+    let conn_run = conn.clone();
+
+    tokio::spawn(async move {
+        conn_run.run().await;
+        println!("run terminated");
+    });
+    conn
+}
+
+/// Get a transport based on its config
+fn get_transport<Octs: Clone + Composer + Debug + Send + Sync + 'static>(
+    config: TransportConfig,
+) -> BoxFuture<'static, Box<dyn QueryMessage2<Octs> + Send + Sync>> {
+    // We have an indirectly recursive async function. This function calls
+    // get_redun which calls this function. The solution is to returned a
+    // boxed future.
+    async move {
+        println!("got config {:?}", config);
+        let a: Box<dyn QueryMessage2<Octs> + Send + Sync> = match config {
+            TransportConfig::Redundant(redun_conf) => {
+                Box::new(get_redun(redun_conf).await)
+            }
+            TransportConfig::Tcp(tcp_conf) => Box::new(get_tcp(tcp_conf)),
+            TransportConfig::Tls(tls_conf) => Box::new(get_tls(tls_conf)),
+            TransportConfig::Udp(udp_conf) => Box::new(get_udp(udp_conf)),
+            TransportConfig::UdpTcp(udptcp_conf) => {
+                Box::new(get_udptcp(udptcp_conf))
+            }
+        };
+        a
+    }
+    .boxed()
+}
+
+/// Start a service based on a transport, a UDP server socket and a buffer
+fn start_service(
+    conn: impl QueryMessage2<Vec<u8>> + Clone + Send + Sync + 'static,
+    socket: UdpSocket,
+    buf_source: Arc<VecBufSource>,
+) -> JoinHandle<Result<(), std::io::Error>> {
+    let svc = query_service(conn);
+    let srv = Arc::new(DgramServer::new(socket, buf_source, Arc::new(svc)));
+    tokio::spawn(srv.run())
+}
+
+/// Get a socket address for an IP address, and optional port and a
+/// default port.
+fn get_sockaddr(
+    addr: &str,
+    port: Option<&str>,
+    default_port: u16,
+) -> SocketAddr {
+    let port = match port {
+        Some(str) => str.parse().unwrap(),
+        None => default_port,
+    };
+
+    SocketAddr::new(IpAddr::from_str(addr).unwrap(), port)
 }

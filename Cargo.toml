@@ -62,14 +62,22 @@ zonefile    = ["bytes", "std"]
 ci-test     = ["resolv", "resolv-sync", "sign", "std", "serde", "tsig", "validate", "zonefile"]
 
 [dev-dependencies]
-clap       = { version = "4", features = ["derive"] }
-rustls             = { version = "0.20.8" }
+clap       = { version = "=4.3.12", features = ["derive"] }
+anstream = "0.3.2"
+anstyle = "=1.0.1"
+clap_lex = "=0.5.0"
+clap_builder = "4.3.12"
+clap_derive = "4.3.12"
+time = "=0.3.23"
+rustls             = { version = "0" }
+serde = { version = "1.0.188", features = ["derive" ] }
+serde_json = "1.0.107"
 serde_test         = "1.0.130"
 serde_yaml         = "0.9"
 tokio            = { version = "1", features = ["rt-multi-thread", "io-util", "net", "test-util"] }
 tokio-native-tls = "0.3"
-tokio-rustls       = { version = "0" }
-webpki-roots       = { version = "0" }
+tokio-rustls       = { version = "0.24.1" }
+webpki-roots       = { version = "0.25.2" }
 
 [package.metadata.docs.rs]
 all-features = true
@@ -103,5 +111,6 @@ required-features = ["serve", "tokio-tfo", "tokio-rustls", "rustls-pemfile"]
 name = "simple-proxy"
 required-features = ["net", "serve"]
 
+[[example]]
 name = "client-transports"
 required-features = ["net"]

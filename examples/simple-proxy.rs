@@ -7,15 +7,16 @@ use clap::Parser;
 use domain::base::iana::Rtype;
 use domain::base::message_builder::PushError;
 use domain::base::opt::{Opt, OptRecord};
-use domain::base::wire::Composer;
 use domain::base::{
     Message, MessageBuilder, ParsedDname, StaticCompressor, StreamTarget,
 };
+use domain::net::client::base_message_builder::BaseMessageBuilder;
+use domain::net::client::bmb;
 use domain::net::client::multi_stream;
-use domain::net::client::query::QueryMessage2;
+use domain::net::client::query::QueryMessage4;
 use domain::net::client::redundant;
-use domain::net::client::tcp_factory::TcpConnFactory;
-use domain::net::client::tls_factory::TlsConnFactory;
+use domain::net::client::tcp_conn_stream::TcpConnStream;
+use domain::net::client::tls_conn_stream::TlsConnStream;
 use domain::net::client::udp;
 use domain::net::client::udp_tcp;
 use domain::rdata::AllRecordData;
@@ -26,7 +27,6 @@ use domain::serve::service::{
 };
 use futures::Stream;
 use futures::{future::BoxFuture, FutureExt};
-use octseq::octets::OctetsFrom;
 use octseq::Octets;
 use rustls::ClientConfig;
 use serde::Deserialize;
@@ -51,6 +51,7 @@ struct Args {
     #[arg(long = "locport", value_parser = clap::value_parser!(u16))]
     locport: Option<u16>,
 
+    /// Configuration
     config: String,
 }
 
@@ -222,7 +223,7 @@ fn to_builder<Octs1: Octets>(
 }
 
 /// Convert a Message into a StreamTarget.
-fn to_stream_target<Octs1: Octets, OctsOut>(
+fn to_stream_target<Octs1: Octets>(
     source: &Message<Octs1>,
 ) -> Result<StreamTarget<Vec<u8>>, PushError> {
     let builder = to_builder(source).unwrap();
@@ -233,48 +234,53 @@ fn to_stream_target<Octs1: Octets, OctsOut>(
 ///
 /// This is a trick to capture the Future by an async block into a type.
 fn query_service<
-    RequestOctets: AsRef<[u8]> + Octets + Send + Sync + 'static,
+    RequestOctets: AsRef<[u8]> + Debug + Octets + Send + Sync + 'static,
 >(
-    conn: impl QueryMessage2<Vec<u8>> + Clone + Send + Sync + 'static,
+    conn: impl QueryMessage4<bmb::BMB<RequestOctets>>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
 ) -> impl Service<RequestOctets>
 where
-    for<'a> &'a RequestOctets: AsRef<[u8]>,
+    for<'a> &'a RequestOctets: AsRef<[u8]> + Debug,
 {
     /// Basic query function for Service.
-    fn query<RequestOctets: AsRef<[u8]> + Octets, ReplyOcts>(
+    fn query<RequestOctets: AsRef<[u8]> + Debug + Octets>(
         message: Message<RequestOctets>,
-        conn: impl QueryMessage2<Vec<u8>> + Send + Sync,
+        conn: impl QueryMessage4<bmb::BMB<RequestOctets>> + Send + Sync,
     ) -> Transaction<
         impl Future<Output = Result<CallResult<Vec<u8>>, ServiceError<()>>>,
         impl Stream<Item = Result<CallResult<Vec<u8>>, ServiceError<()>>>,
     >
     where
-        for<'a> &'a RequestOctets: AsRef<[u8]>,
+        for<'a> &'a RequestOctets: AsRef<[u8]> + Debug,
     {
         Transaction::<_, NoStream<Vec<u8>>>::Single(async move {
             // Extract the ID. We need to set it in the reply.
             let id = message.header().id();
             // We get a Message, but the client transport needs a
-            // MessageBuilder. Convert.
+            // BaseMessageBuilder. Convert.
             println!("request {:?}", message);
-            let mut msg_builder = to_builder(&message).unwrap();
-            println!("request {:?}", msg_builder);
-            let mut query = conn.query(&mut msg_builder).await.unwrap();
+            let bmb = bmb::BMB::new(message);
+            println!("request {:?}", bmb);
+            let mut query = conn.query(&bmb).await.unwrap();
             let reply = query.get_result().await.unwrap();
             println!("got reply {:?}", reply);
 
             // Set the ID
-            let mut reply: Message<Vec<u8>> = OctetsFrom::octets_from(reply);
+            let mut reply: Message<Vec<u8>> =
+                Message::from_octets(reply.as_slice().to_vec()).unwrap();
             reply.header_mut().set_id(id);
 
             // We get the reply as Message from the client transport but
             // we need to return a StreamTarget. Convert.
-            let stream = to_stream_target::<_, Vec<u8>>(&reply).unwrap();
+            let stream = to_stream_target::<_>(&reply).unwrap();
             Ok(CallResult::new(stream))
         })
     }
 
-    move |message| Ok(query::<RequestOctets, Vec<u8>>(message, conn.clone()))
+    move |message| Ok(query::<RequestOctets>(message, conn.clone()))
 }
 
 /*
@@ -371,6 +377,9 @@ impl Future for VecSingle {
     }
 }
 
+/// Vector of octets
+type VecU8 = Vec<u8>;
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -402,23 +411,23 @@ async fn main() {
     // query_service because it lacks Clone.
     let udp_join_handle = match conf.upstream {
         TransportConfig::Redundant(redun_conf) => {
-            let redun = get_redun::<Vec<u8>>(redun_conf).await;
+            let redun = get_redun::<bmb::BMB<VecU8>>(redun_conf).await;
             start_service(redun, udpsocket2, buf_source)
         }
         TransportConfig::Tcp(tcp_conf) => {
-            let tcp = get_tcp::<Vec<u8>>(tcp_conf);
+            let tcp = get_tcp::<bmb::BMB<VecU8>>(tcp_conf);
             start_service(tcp, udpsocket2, buf_source)
         }
         TransportConfig::Tls(tls_conf) => {
-            let tls = get_tls::<Vec<u8>>(tls_conf);
+            let tls = get_tls::<bmb::BMB<VecU8>>(tls_conf);
             start_service(tls, udpsocket2, buf_source)
         }
         TransportConfig::Udp(udp_conf) => {
-            let udp = get_udp::<Vec<u8>>(udp_conf);
+            let udp = get_udp::<bmb::BMB<VecU8>>(udp_conf);
             start_service(udp, udpsocket2, buf_source)
         }
         TransportConfig::UdpTcp(udptcp_conf) => {
-            let udptcp = get_udptcp::<Vec<u8>>(udptcp_conf);
+            let udptcp = get_udptcp::<bmb::BMB<VecU8>>(udptcp_conf);
             start_service(udptcp, udpsocket2, buf_source)
         }
     };
@@ -427,11 +436,13 @@ async fn main() {
 }
 
 /// Get a redundant transport based on its config
-async fn get_redun<Octs: Clone + Composer + Debug + Send + Sync + 'static>(
+async fn get_redun<
+    BMB: BaseMessageBuilder + Clone + Debug + Send + Sync + 'static,
+>(
     config: RedundantConfig,
-) -> redundant::Connection<Octs> {
+) -> redundant::Connection<BMB> {
     println!("Creating new redundant::Connection");
-    let redun = redundant::Connection::<Octs>::new().unwrap();
+    let redun = redundant::Connection::new(None).unwrap();
     let redun_run = redun.clone();
     tokio::spawn(async move {
         redun_run.run().await;
@@ -439,24 +450,24 @@ async fn get_redun<Octs: Clone + Composer + Debug + Send + Sync + 'static>(
     println!("Adding to redundant::Connection");
     for e in config.transports {
         println!("Add to redundant::Connection");
-        redun.add(get_transport(e).await).await;
+        redun.add(get_transport(e).await).await.unwrap();
         println!("After Add to redundant::Connection");
     }
     redun
 }
 
 /// Get a TCP transport based on its config
-fn get_tcp<Octs: Clone + Composer + Debug + Send + Sync + 'static>(
+fn get_tcp<BMB: BaseMessageBuilder + Clone + 'static>(
     config: TcpConfig,
-) -> impl QueryMessage2<Octs> + Clone + Send + Sync {
+) -> impl QueryMessage4<BMB> + Clone + Send + Sync {
     let sockaddr = get_sockaddr(&config.addr, config.port.as_deref(), 53);
-    let tcp_factory = TcpConnFactory::new(sockaddr);
+    let tcp_conn_stream = TcpConnStream::new(sockaddr);
 
-    let conn = multi_stream::Connection::new().unwrap();
+    let conn = multi_stream::Connection::new(None).unwrap();
     let conn_run = conn.clone();
 
     tokio::spawn(async move {
-        conn_run.run(tcp_factory).await;
+        conn_run.run(tcp_conn_stream).await.unwrap();
         println!("run terminated");
     });
 
@@ -464,9 +475,9 @@ fn get_tcp<Octs: Clone + Composer + Debug + Send + Sync + 'static>(
 }
 
 /// Get a TLS transport based on its config
-fn get_tls<Octs: Clone + Composer + Debug + Send + Sync + 'static>(
+fn get_tls<BMB: BaseMessageBuilder + Clone + 'static>(
     config: TlsConfig,
-) -> impl QueryMessage2<Octs> + Clone + Send + Sync {
+) -> impl QueryMessage4<BMB> + Clone + Send + Sync {
     let sockaddr = get_sockaddr(&config.addr, config.port.as_deref(), 853);
 
     let mut root_store = rustls::RootCertStore::empty();
@@ -486,14 +497,14 @@ fn get_tls<Octs: Clone + Composer + Debug + Send + Sync + 'static>(
             .with_no_client_auth(),
     );
 
-    let tls_factory =
-        TlsConnFactory::new(client_config, &config.servername, sockaddr);
+    let tls_conn_stream =
+        TlsConnStream::new(client_config, &config.servername, sockaddr);
 
-    let conn = multi_stream::Connection::new().unwrap();
+    let conn = multi_stream::Connection::new(None).unwrap();
     let conn_run = conn.clone();
 
     tokio::spawn(async move {
-        conn_run.run(tls_factory).await;
+        conn_run.run(tls_conn_stream).await.unwrap();
         println!("run terminated");
     });
 
@@ -501,39 +512,39 @@ fn get_tls<Octs: Clone + Composer + Debug + Send + Sync + 'static>(
 }
 
 /// Get a UDP-only transport based on its config
-fn get_udp<Octs: Clone + Composer + Debug + Send + Sync + 'static>(
+fn get_udp<BMB: BaseMessageBuilder + Clone + 'static>(
     config: UdpConfig,
-) -> impl QueryMessage2<Octs> + Clone + Send + Sync {
+) -> impl QueryMessage4<BMB> + Clone + Send + Sync {
     let sockaddr = get_sockaddr(&config.addr, config.port.as_deref(), 53);
 
-    udp::Connection::new(sockaddr).unwrap()
+    udp::Connection::new(None, sockaddr).unwrap()
 }
 
 /// Get a UDP+TCP transport based on its config
-fn get_udptcp<Octs: Clone + Composer + Debug + Send + Sync + 'static>(
+fn get_udptcp<BMB: BaseMessageBuilder + Clone + 'static>(
     config: UdpTcpConfig,
-) -> impl QueryMessage2<Octs> + Clone + Send + Sync {
+) -> impl QueryMessage4<BMB> + Clone + Send + Sync {
     let sockaddr = get_sockaddr(&config.addr, config.port.as_deref(), 53);
-    let conn = udp_tcp::Connection::new(sockaddr).unwrap();
+    let conn = udp_tcp::Connection::new(None, sockaddr).unwrap();
     let conn_run = conn.clone();
 
     tokio::spawn(async move {
-        conn_run.run().await;
+        conn_run.run().await.unwrap();
         println!("run terminated");
     });
     conn
 }
 
 /// Get a transport based on its config
-fn get_transport<Octs: Clone + Composer + Debug + Send + Sync + 'static>(
+fn get_transport<BMB: BaseMessageBuilder + Clone + 'static>(
     config: TransportConfig,
-) -> BoxFuture<'static, Box<dyn QueryMessage2<Octs> + Send + Sync>> {
+) -> BoxFuture<'static, Box<dyn QueryMessage4<BMB> + Send + Sync>> {
     // We have an indirectly recursive async function. This function calls
-    // get_redun which calls this function. The solution is to returned a
+    // get_redun which calls this function. The solution is to return a
     // boxed future.
     async move {
         println!("got config {:?}", config);
-        let a: Box<dyn QueryMessage2<Octs> + Send + Sync> = match config {
+        let a: Box<dyn QueryMessage4<BMB> + Send + Sync> = match config {
             TransportConfig::Redundant(redun_conf) => {
                 Box::new(get_redun(redun_conf).await)
             }
@@ -551,7 +562,7 @@ fn get_transport<Octs: Clone + Composer + Debug + Send + Sync + 'static>(
 
 /// Start a service based on a transport, a UDP server socket and a buffer
 fn start_service(
-    conn: impl QueryMessage2<Vec<u8>> + Clone + Send + Sync + 'static,
+    conn: impl QueryMessage4<bmb::BMB<VecU8>> + Clone + Send + Sync + 'static,
     socket: UdpSocket,
     buf_source: Arc<VecBufSource>,
 ) -> JoinHandle<Result<(), std::io::Error>> {

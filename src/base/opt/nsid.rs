@@ -86,11 +86,13 @@ impl Nsid<[u8]> {
     ///
     /// The caller has to make sure that `octets` is no longer than 65,535
     /// octets.
+    #[must_use]
     pub unsafe fn from_slice_unchecked(slice: &[u8]) -> &Self {
         &*(slice as *const [u8] as *const Self)
     }
 
     /// Creates an empty NSID option value.
+    #[must_use]
     pub fn empty() -> &'static Self {
         unsafe { Self::from_slice_unchecked(b"") }
     }
@@ -288,6 +290,7 @@ mod test {
     use super::super::test::test_option_compose_parse;
     
     #[test]
+    #[allow(clippy::redundant_closure)] // lifetimes ...
     fn nsid_compose_parse() {
         test_option_compose_parse(
             &Nsid::from_octets("foo").unwrap(),

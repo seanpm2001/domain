@@ -150,6 +150,7 @@ impl<Variant> Understood<Variant, [u8]> {
     ///
     /// The caller needs to make sure that the slice contains a sequence of
     /// 16 bit values that is no longer than 65,535 octets.
+    #[must_use]
     pub unsafe fn from_slice_unchecked(slice: &[u8]) -> &Self {
         &*(slice as *const [u8] as *const Self)
     }
@@ -498,6 +499,7 @@ mod test {
     use super::super::test::test_option_compose_parse;
 
     #[test]
+    #[allow(clippy::redundant_closure)] // lifetimes ...
     fn dau_compose_parse() {
         test_option_compose_parse(
             &Dau::from_octets("foof").unwrap(),

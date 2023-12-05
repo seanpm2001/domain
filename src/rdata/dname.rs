@@ -1,10 +1,9 @@
 use crate::base::cmp::CanonicalOrd;
-use crate::base::name::{ParsedDname, PushError, ToDname};
+use crate::base::name::{ParsedDname, ToDname};
 use crate::base::wire::ParseError;
 use core::cmp::Ordering;
 use core::str::FromStr;
 use core::{fmt, hash};
-use octseq::builder::{EmptyBuilder, FromBuilder};
 use octseq::octets::{Octets, OctetsFrom};
 use octseq::parse::Parser;
 
@@ -42,6 +41,7 @@ mod test {
     // This covers all the other generated types, too.
 
     #[test]
+    #[allow(clippy::redundant_closure)] // lifetimes ...
     fn dname_compose_parse_scan() {
         let rdata =
             Dname::<Name<Vec<u8>>>::from_str("www.example.com").unwrap();

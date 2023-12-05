@@ -26,10 +26,12 @@ pub struct Aaaa {
 }
 
 impl Aaaa {
+    #[must_use]
     pub fn new(addr: Ipv6Addr) -> Aaaa {
         Aaaa { addr }
     }
 
+    #[must_use]
     pub fn addr(&self) -> Ipv6Addr {
         self.addr
     }
@@ -37,11 +39,11 @@ impl Aaaa {
         self.addr = addr
     }
 
-    pub(super) fn flatten_into<E>(self) -> Result<Aaaa, E> {
+    pub(super) fn convert_octets<E>(self) -> Result<Self, E> {
         Ok(self)
     }
 
-    pub(super) fn convert_octets<E>(self) -> Result<Self, E> {
+    pub(super) fn flatten<E>(self) -> Result<Self, E> {
         Ok(self)
     }
 

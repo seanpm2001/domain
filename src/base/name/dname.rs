@@ -8,7 +8,7 @@ use super::super::wire::{FormError, ParseError};
 use super::builder::{DnameBuilder, FromStrError};
 use super::label::{Label, LabelTypeError, SplitLabelError};
 use super::relative::{DnameIter, RelativeDname};
-use super::traits::{ToDname, ToLabelIter};
+use super::traits::{FlattenInto, ToDname, ToLabelIter};
 #[cfg(feature = "bytes")]
 use bytes::Bytes;
 use core::ops::{Bound, RangeBounds};
@@ -174,6 +174,7 @@ impl<Octs> Dname<Octs> {
     /// [`root_ref`]: #method.root_ref
     /// [`root_vec`]: #method.root_vec
     /// [`root_bytes`]: #method.root_bytes
+    #[must_use]
     pub fn root() -> Self
     where
         Octs: From<&'static [u8]>,
@@ -209,6 +210,7 @@ impl Dname<[u8]> {
     }
 
     /// Creates a domain name for the root label only atop an octets slice.
+    #[must_use]
     pub fn root_slice() -> &'static Self {
         unsafe { Self::from_slice_unchecked("\0".as_ref()) }
     }
@@ -238,6 +240,7 @@ impl Dname<[u8]> {
 
 impl Dname<&'static [u8]> {
     /// Creates a domain name for the root label only atop a slice reference.
+    #[must_use]
     pub fn root_ref() -> Self {
         Self::root()
     }
@@ -246,6 +249,7 @@ impl Dname<&'static [u8]> {
 #[cfg(feature = "std")]
 impl Dname<Vec<u8>> {
     /// Creates a domain name for the root label only atop a `Vec<u8>`.
+    #[must_use]
     pub fn root_vec() -> Self {
         Self::root()
     }
@@ -667,7 +671,7 @@ impl<Octs> Dname<Octs> {
 
     /// Peeks at a parser and returns the length of a name at its beginning.
     fn parse_name_len<Source: AsRef<[u8]> + ?Sized>(
-        parser: &mut Parser<Source>,
+        parser: &Parser<Source>,
     ) -> Result<usize, ParseError> {
         let len = {
             let mut tmp = parser.peek_all();
@@ -745,6 +749,20 @@ where
     /// [`UncertainDname`]: struct.UncertainDname.html
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::from_chars(s.chars())
+    }
+}
+
+//--- FlattenInto
+
+impl<Octs, Target> FlattenInto<Dname<Target>> for Dname<Octs>
+where
+    Target: OctetsFrom<Octs>,
+{
+    type AppendError = Target::Error;
+
+    fn try_flatten_into(self) -> Result<Dname<Target>, Self::AppendError> {
+        Target::try_octets_from(self.0)
+            .map(|octets| unsafe { Dname::from_octets_unchecked(octets) })
     }
 }
 

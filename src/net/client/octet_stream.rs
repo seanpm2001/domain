@@ -20,33 +20,31 @@
 use bytes;
 use bytes::{Bytes, BytesMut};
 use core::convert::From;
-use futures::lock::Mutex as Futures_mutex;
 use std::boxed::Box;
 use std::fmt::Debug;
 use std::future::Future;
+use std::io::ErrorKind;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::vec::Vec;
 
-use crate::base::wire::Composer;
 use crate::base::{
-    opt::{AllOptData, Opt, OptRecord, TcpKeepalive},
-    Message, MessageBuilder, ParsedDname, Rtype, StaticCompressor,
-    StreamTarget,
+    opt::{AllOptData, OptRecord, TcpKeepalive},
+    Message,
 };
+use crate::net::client::base_message_builder::BaseMessageBuilder;
+use crate::net::client::base_message_builder::OptTypes;
 use crate::net::client::error::Error;
-use crate::net::client::query::{GetResult, QueryMessage};
-use crate::rdata::AllRecordData;
-use octseq::{Octets, OctetsBuilder};
+use crate::net::client::query::{GetResult, QueryMessage4};
+use octseq::Octets;
 
-use tokio::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep;
 
-/// Time to wait on a non-idle connection for the other side to send
-/// a response on any outstanding query.
+/// Default configuration value for the amount of time to wait on a non-idle
+/// connection for the other side to send a response on any outstanding query.
 // Implement a simple response timer to see if the connection and the server
 // are alive. Set the timer when the connection goes from idle to busy.
 // Reset the timer each time a reply arrives. Cancel the timer when the
@@ -54,7 +52,13 @@ use tokio::time::sleep;
 // queries as timed out and shutdown the connection.
 //
 // Note: nsd has 120 seconds, unbound has 3 seconds.
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(19);
+const DEF_RESPONSE_TIMEOUT: Duration = Duration::from_secs(19);
+
+/// Minimum configuration value for response_timeout.
+const MIN_RESPONSE_TIMEOUT: Duration = Duration::from_millis(1);
+
+/// Maximum configuration value for response_timeout.
+const MAX_RESPONSE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Capacity of the channel that transports [ChanReq].
 const DEF_CHAN_CAP: usize = 8;
@@ -63,77 +67,108 @@ const DEF_CHAN_CAP: usize = 8;
 /// [InnerConnection::run].
 const READ_REPLY_CHAN_CAP: usize = 8;
 
-/// This is the type of sender in [ChanReq].
-type ReplySender = oneshot::Sender<ChanResp>;
+//------------ Config ---------------------------------------------------------
 
-#[derive(Debug)]
-/// A request from [Query] to [Connection::run] to start a DNS request.
-struct ChanReq<Octs: OctetsBuilder> {
-    /// DNS request message
-    msg: MessageBuilder<StaticCompressor<StreamTarget<Octs>>>,
-
-    /// Sender to send result back to [Query]
-    sender: ReplySender,
+/// Configuration for an octet_stream transport connection.
+#[derive(Clone, Debug)]
+pub struct Config {
+    /// Response timeout.
+    pub response_timeout: Duration,
 }
 
-#[derive(Debug)]
-/// a response to a [ChanReq].
-struct Response {
-    /// The DNS reply message.
-    reply: Message<Bytes>,
-}
-/// Response to the DNS request sent by [InnerConnection::run] to [Query].
-type ChanResp = Result<Response, Error>;
-
-/// The actual implementation of [Connection].
-#[derive(Debug)]
-struct InnerConnection<Octs: OctetsBuilder> {
-    /// [InnerConnection::sender] and [InnerConnection::receiver] are
-    /// part of a single channel.
-    ///
-    /// Used by [Query] to send requests to [InnerConnection::run].
-    sender: mpsc::Sender<ChanReq<Octs>>,
-
-    /// receiver part of the channel.
-    ///
-    /// Protected by a mutex to allow read/write access by
-    /// [InnerConnection::run].
-    /// The Option is to allow [InnerConnection::run] to signal that the
-    /// connection is closed.
-    receiver: Futures_mutex<Option<mpsc::Receiver<ChanReq<Octs>>>>,
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            response_timeout: DEF_RESPONSE_TIMEOUT,
+        }
+    }
 }
 
-/// Internal datastructure of [InnerConnection::run] to keep track of
-/// outstanding DNS requests.
-struct Queries {
-    /// The number of elements in [Queries::vec] that are not None.
-    count: usize,
-
-    /// Index in the [Queries::vec] where to look for a space for a new query.
-    curr: usize,
-
-    /// Vector of senders to forward a DNS reply message (or error) to.
-    vec: Vec<Option<ReplySender>>,
-}
+//------------ Connection -----------------------------------------------------
 
 #[derive(Clone, Debug)]
 /// A single DNS over octect stream connection.
-pub struct Connection<Octs: OctetsBuilder> {
+pub struct Connection<BMB> {
     /// Reference counted [InnerConnection].
-    inner: Arc<InnerConnection<Octs>>,
+    inner: Arc<InnerConnection<BMB>>,
 }
 
-/// Status of a query. Used in [Query].
-#[derive(Debug)]
-enum QueryState {
-    /// A request is in progress.
+impl<BMB: BaseMessageBuilder + Clone + 'static> Connection<BMB> {
+    /// Constructor for [Connection].
     ///
-    /// The receiver for receiving the response is part of this state.
-    Busy(oneshot::Receiver<ChanResp>),
+    /// Returns a [Connection] wrapped in a [Result](io::Result).
+    pub fn new(config: Option<Config>) -> Result<Self, Error> {
+        let config = match config {
+            Some(config) => {
+                check_config(&config)?;
+                config
+            }
+            None => Default::default(),
+        };
+        let connection = InnerConnection::new(config)?;
+        Ok(Self {
+            inner: Arc::new(connection),
+        })
+    }
 
-    /// The response has been received and the query is done.
-    Done,
+    /// Main execution function for [Connection].
+    ///
+    /// This function has to run in the background or together with
+    /// any calls to [query](Self::query) or [Query::get_result].
+    /// Worker function for a connection object.
+    pub fn run<IO: AsyncReadExt + AsyncWriteExt + Send + Unpin + 'static>(
+        &self,
+        io: IO,
+    ) -> Pin<Box<dyn Future<Output = Option<()>> + Send>> {
+        self.inner.run(io)
+    }
+
+    /// Start a DNS request.
+    ///
+    /// This function takes a precomposed message as a parameter and
+    /// returns a [Query] object wrapped in a [Result].
+    async fn query_impl4(
+        &self,
+        query_msg: &BMB,
+    ) -> Result<Box<dyn GetResult + Send>, Error> {
+        let (tx, rx) = oneshot::channel();
+        self.inner.query(tx, query_msg).await?;
+        let msg = query_msg;
+        Ok(Box::new(Query::new(msg, rx)))
+    }
+
+    /// Start a DNS request but do not check if the reply matches the request.
+    ///
+    /// This function is similar to [Self::query]. Not checking if the reply
+    /// match the request avoids having to keep the request around.
+    pub async fn query_no_check(
+        &self,
+        query_msg: &BMB,
+    ) -> Result<QueryNoCheck, Error> {
+        let (tx, rx) = oneshot::channel();
+        self.inner.query(tx, query_msg).await?;
+        Ok(QueryNoCheck::new(rx))
+    }
 }
+
+impl<BMB: BaseMessageBuilder + Clone + 'static> QueryMessage4<BMB>
+    for Connection<BMB>
+{
+    fn query<'a>(
+        &'a self,
+        query_msg: &'a BMB,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Box<dyn GetResult + Send>, Error>>
+                + Send
+                + '_,
+        >,
+    > {
+        return Box::pin(self.query_impl4(query_msg));
+    }
+}
+
+//------------ Query ----------------------------------------------------------
 
 /// This struct represent an active DNS query.
 #[derive(Debug)]
@@ -148,6 +183,83 @@ pub struct Query {
     state: QueryState,
 }
 
+/// Status of a query. Used in [Query].
+#[derive(Debug)]
+enum QueryState {
+    /// A request is in progress.
+    ///
+    /// The receiver for receiving the response is part of this state.
+    Busy(oneshot::Receiver<ChanResp>),
+
+    /// The response has been received and the query is done.
+    Done,
+}
+
+impl Query {
+    /// Constructor for [Query], takes a DNS query and a receiver for the
+    /// reply.
+    fn new<BMB: BaseMessageBuilder>(
+        query_msg: &BMB,
+        receiver: oneshot::Receiver<ChanResp>,
+    ) -> Query {
+        let vec = query_msg.to_vec();
+        let msg = Message::from_octets(vec)
+            .expect("Message failed to parse contents of another Message");
+        Self {
+            query_msg: msg,
+            state: QueryState::Busy(receiver),
+        }
+    }
+
+    /// Get the result of a DNS query.
+    ///
+    /// This function returns the reply to a DNS query wrapped in a
+    /// [Result].
+    pub async fn get_result_impl(&mut self) -> Result<Message<Bytes>, Error> {
+        match self.state {
+            QueryState::Busy(ref mut receiver) => {
+                let res = receiver.await;
+                self.state = QueryState::Done;
+                if res.is_err() {
+                    // Assume receive error
+                    return Err(Error::StreamReceiveError);
+                }
+                let res = res.expect("already check error case");
+
+                // clippy seems to be wrong here. Replacing
+                // the following with 'res?;' doesn't work
+                #[allow(clippy::question_mark)]
+                if let Err(err) = res {
+                    return Err(err);
+                }
+
+                let resp = res.expect("error case is checked already");
+                let msg = resp.reply;
+
+                if !is_answer_ignore_id(&msg, &self.query_msg) {
+                    return Err(Error::WrongReplyForQuery);
+                }
+                Ok(msg)
+            }
+            QueryState::Done => {
+                panic!("Already done");
+            }
+        }
+    }
+}
+
+impl GetResult for Query {
+    fn get_result(
+        &mut self,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Message<Bytes>, Error>> + Send + '_>,
+    > {
+        Box::pin(self.get_result_impl())
+    }
+}
+
+//------------ QueryNoCheck ---------------------------------------------------
+
 /// This represents that state of an active DNS query if there is no need
 /// to check that the reply matches the request. The assumption is that the
 /// caller will do this check.
@@ -155,6 +267,108 @@ pub struct Query {
 pub struct QueryNoCheck {
     /// Current state of the query.
     state: QueryState,
+}
+
+impl QueryNoCheck {
+    /// Constructor for [Query], takes a DNS query and a receiver for the
+    /// reply.
+    fn new(receiver: oneshot::Receiver<ChanResp>) -> QueryNoCheck {
+        Self {
+            state: QueryState::Busy(receiver),
+        }
+    }
+
+    /// Get the result of a DNS query.
+    ///
+    /// This function returns the reply to a DNS query wrapped in a
+    /// [Result].
+    pub async fn get_result(&mut self) -> Result<Message<Bytes>, Error> {
+        match self.state {
+            QueryState::Busy(ref mut receiver) => {
+                let res = receiver.await;
+                self.state = QueryState::Done;
+                if res.is_err() {
+                    // Assume receive error
+                    return Err(Error::StreamReceiveError);
+                }
+                let res = res.expect("error case is checked already");
+
+                // clippy seems to be wrong here. Replacing
+                // the following with 'res?;' doesn't work
+                #[allow(clippy::question_mark)]
+                if let Err(err) = res {
+                    return Err(err);
+                }
+
+                let resp = res.expect("error case is checked already");
+                let msg = resp.reply;
+
+                Ok(msg)
+            }
+            QueryState::Done => {
+                panic!("Already done");
+            }
+        }
+    }
+}
+
+//------------ InnerConnection ------------------------------------------------
+
+/// The actual implementation of [Connection].
+#[derive(Debug)]
+struct InnerConnection<BMB> {
+    /// User configuration variables.
+    config: Config,
+
+    /// [InnerConnection::sender] and [InnerConnection::receiver] are
+    /// part of a single channel.
+    ///
+    /// Used by [Query] to send requests to [InnerConnection::run].
+    sender: mpsc::Sender<ChanReq<BMB>>,
+
+    /// receiver part of the channel.
+    ///
+    /// Protected by a mutex to allow read/write access by
+    /// [InnerConnection::run].
+    /// The Option is to allow [InnerConnection::run] to signal that the
+    /// connection is closed.
+    receiver: Mutex<Option<mpsc::Receiver<ChanReq<BMB>>>>,
+}
+
+#[derive(Debug)]
+/// A request from [Query] to [Connection::run] to start a DNS request.
+struct ChanReq<BMB> {
+    /// DNS request message
+    msg: BMB,
+
+    /// Sender to send result back to [Query]
+    sender: ReplySender,
+}
+
+/// This is the type of sender in [ChanReq].
+type ReplySender = oneshot::Sender<ChanResp>;
+
+/// Response to the DNS request sent by [InnerConnection::run] to [Query].
+type ChanResp = Result<Response, Error>;
+
+#[derive(Debug)]
+/// a response to a [ChanReq].
+struct Response {
+    /// The DNS reply message.
+    reply: Message<Bytes>,
+}
+
+/// Internal datastructure of [InnerConnection::run] to keep track of
+/// outstanding DNS requests.
+struct Queries {
+    /// The number of elements in [Queries::vec] that are not None.
+    count: usize,
+
+    /// Index in the [Queries::vec] where to look for a space for a new query.
+    curr: usize,
+
+    /// Vector of senders to forward a DNS reply message (or error) to.
+    vec: Vec<Option<ReplySender>>,
 }
 
 /// Internal datastructure of [InnerConnection::run] to keep track of
@@ -178,6 +392,7 @@ struct Status {
     /// edns-tcp-keepalive option may change that.
     idle_timeout: Option<Duration>,
 }
+
 /// Status of the connection. Used in [Status].
 enum ConnState {
     /// The connection is in this state from the start and when at least
@@ -212,27 +427,41 @@ enum ConnState {
 // This type could be local to InnerConnection, but I don't know how
 type ReaderChanReply = Message<Bytes>;
 
-impl<Octs: AsMut<[u8]> + Clone + Composer + Debug + OctetsBuilder>
-    InnerConnection<Octs>
-{
+impl<BMB: BaseMessageBuilder + Clone + 'static> InnerConnection<BMB> {
     /// Constructor for [InnerConnection].
     ///
     /// This is the implementation of [Connection::new].
-    pub fn new() -> io::Result<InnerConnection<Octs>> {
+    pub fn new(config: Config) -> Result<Self, Error> {
         let (tx, rx) = mpsc::channel(DEF_CHAN_CAP);
         Ok(Self {
+            config,
             sender: tx,
-            receiver: Futures_mutex::new(Some(rx)),
+            receiver: Mutex::new(Some(rx)),
         })
+    }
+
+    /// Run method.
+    ///
+    /// Make sure the future does not contain a reference to self.
+    pub fn run<IO: AsyncReadExt + AsyncWriteExt + Send + Unpin + 'static>(
+        &self,
+        io: IO,
+    ) -> Pin<Box<dyn Future<Output = Option<()>> + Send>> {
+        let mut receiver = self.receiver.lock().unwrap();
+        let opt_receiver = receiver.take();
+        drop(receiver);
+
+        Box::pin(Self::run_impl(self.config.clone(), io, opt_receiver))
     }
 
     /// Main execution function for [InnerConnection].
     ///
     /// This function Gets called by [Connection::run].
     /// This function is not async cancellation safe
-    pub async fn run<IO: AsyncReadExt + AsyncWriteExt + Unpin>(
-        &self,
+    async fn run_impl<IO: AsyncReadExt + AsyncWriteExt + Unpin>(
+        config: Config,
         io: IO,
+        opt_receiver: Option<mpsc::Receiver<ChanReq<BMB>>>,
     ) -> Option<()> {
         let (reply_sender, mut reply_receiver) =
             mpsc::channel::<ReaderChanReply>(READ_REPLY_CHAN_CAP);
@@ -242,11 +471,7 @@ impl<Octs: AsMut<[u8]> + Clone + Composer + Debug + OctetsBuilder>
         let reader_fut = Self::reader(&mut read_stream, reply_sender);
         tokio::pin!(reader_fut);
 
-        let mut receiver = {
-            let mut locked_opt_receiver = self.receiver.lock().await;
-            let opt_receiver = locked_opt_receiver.take();
-            opt_receiver.expect("no receiver present?")
-        };
+        let mut receiver = { opt_receiver.expect("no receiver present?") };
 
         let mut status = Status {
             state: ConnState::Active(None),
@@ -266,7 +491,7 @@ impl<Octs: AsMut<[u8]> + Clone + Composer + Debug + OctetsBuilder>
                 ConnState::Active(opt_instant) => {
                     if let Some(instant) = opt_instant {
                         let elapsed = instant.elapsed();
-                        if elapsed > RESPONSE_TIMEOUT {
+                        if elapsed > config.response_timeout {
                             Self::error(
                                 Error::StreamReadTimeout,
                                 &mut query_vec,
@@ -274,7 +499,7 @@ impl<Octs: AsMut<[u8]> + Clone + Composer + Debug + OctetsBuilder>
                             status.state = ConnState::ReadTimeout;
                             break;
                         }
-                        Some(RESPONSE_TIMEOUT - elapsed)
+                        Some(config.response_timeout - elapsed)
                     } else {
                         None
                     }
@@ -307,7 +532,7 @@ impl<Octs: AsMut<[u8]> + Clone + Composer + Debug + OctetsBuilder>
                 None =>
                 // Just use the response timeout
                 {
-                    RESPONSE_TIMEOUT
+                    config.response_timeout
                 }
             };
 
@@ -374,9 +599,13 @@ impl<Octs: AsMut<[u8]> + Clone + Composer + Debug + OctetsBuilder>
                 res = recv_fut, if !do_write => {
                     match res {
                         Some(req) =>
-                            self.insert_req(req, &mut status,
+                            Self::insert_req(req, &mut status,
                                 &mut reqmsg, &mut query_vec),
-                        None => panic!("recv failed"),
+                        None => {
+                // All references to the connection object have
+                // been dropped. Shutdown.
+                break;
+            }
                     }
                 }
                 _ = sleep_fut => {
@@ -410,14 +639,13 @@ impl<Octs: AsMut<[u8]> + Clone + Composer + Debug + OctetsBuilder>
     pub async fn query(
         &self,
         sender: oneshot::Sender<ChanResp>,
-        query_msg: &mut MessageBuilder<StaticCompressor<StreamTarget<Octs>>>,
+        query_msg: &BMB,
     ) -> Result<(), Error> {
         // We should figure out how to get query_msg.
-        let msg_clone = query_msg.clone();
 
         let req = ChanReq {
             sender,
-            msg: msg_clone,
+            msg: query_msg.clone(),
         };
         match self.sender.send(req).await {
             Err(_) =>
@@ -554,7 +782,8 @@ impl<Octs: AsMut<[u8]> + Clone + Composer + Debug + OctetsBuilder>
                 return;
             }
             Some(_) => {
-                let sender = Self::take_query(query_vec, index).unwrap();
+                let sender = Self::take_query(query_vec, index)
+                    .expect("sender should be there");
                 let reply = Response { reply: answer };
                 _ = sender.send(Ok(reply));
             }
@@ -583,8 +812,7 @@ impl<Octs: AsMut<[u8]> + Clone + Composer + Debug + OctetsBuilder>
     /// idle. Addend a edns-tcp-keepalive option if needed.
     // Note: maybe reqmsg should be a return value.
     fn insert_req(
-        &self,
-        mut req: ChanReq<Octs>,
+        mut req: ChanReq<BMB>,
         status: &mut Status,
         reqmsg: &mut Option<Vec<u8>>,
         query_vec: &mut Queries,
@@ -634,7 +862,9 @@ impl<Octs: AsMut<[u8]> + Clone + Composer + Debug + OctetsBuilder>
             }
         };
 
-        let ind16: u16 = index.try_into().unwrap();
+        let ind16: u16 = index
+            .try_into()
+            .expect("insert should return a value that fits in u16");
 
         // We set the ID to the array index. Defense in depth
         // suggests that a random ID is better because it works
@@ -643,27 +873,18 @@ impl<Octs: AsMut<[u8]> + Clone + Composer + Debug + OctetsBuilder>
         // if many spoofed answers arrive over UDP: "TCP, by the
         // nature of its use of sequence numbers, is far more
         // resilient against forgery by third parties."
+
         let hdr = req.msg.header_mut();
         hdr.set_id(ind16);
 
         if status.send_keepalive {
-            let res_msg = add_tcp_keepalive(&req.msg);
+            let res = add_tcp_keepalive(&mut req.msg);
 
-            match res_msg {
-                Ok(msg) => {
-                    Self::convert_query(&msg, reqmsg);
-                    status.send_keepalive = false;
-                }
-                Err(_) => {
-                    // Adding keepalive option
-                    // failed. Send the original
-                    // request.
-                    Self::convert_query(&req.msg, reqmsg);
-                }
+            if let Ok(()) = res {
+                status.send_keepalive = false;
             }
-        } else {
-            Self::convert_query(&req.msg, reqmsg);
         }
+        Self::convert_query(&req.msg, reqmsg);
     }
 
     /// Take an element out of query_vec.
@@ -687,15 +908,22 @@ impl<Octs: AsMut<[u8]> + Clone + Composer + Debug + OctetsBuilder>
     /// Convert the query message to a vector.
     // This function should return the vector instead of storing it
     // through a reference.
-    fn convert_query<Target: AsMut<[u8]> + AsRef<[u8]>>(
-        msg: &MessageBuilder<StaticCompressor<StreamTarget<Target>>>,
+    fn convert_query(
+        msg: &dyn BaseMessageBuilder,
         reqmsg: &mut Option<Vec<u8>>,
     ) {
-        let vec = msg.as_target().as_target().as_stream_slice();
+        // Ideally there should be a write_all_vectored. Until there is one,
+        // copy to a new Vec and prepend the length octets.
 
-        // Store a clone of the request. That makes life easier
-        // and requests tend to be small
-        *reqmsg = Some(vec.to_vec());
+        let slice = msg.to_vec();
+        let len = slice.len();
+
+        let mut vec = Vec::with_capacity(2 + len);
+        let len16 = len as u16;
+        vec.extend_from_slice(&len16.to_be_bytes());
+        vec.extend_from_slice(&slice);
+
+        *reqmsg = Some(vec);
     }
 
     /// Insert a sender (for the reply) in the query_vec and return the index.
@@ -763,289 +991,14 @@ impl<Octs: AsMut<[u8]> + Clone + Composer + Debug + OctetsBuilder>
     }
 }
 
-impl<
-        Octs: AsMut<[u8]>
-            + AsRef<[u8]>
-            + Clone
-            + Composer
-            + Debug
-            + OctetsBuilder
-            + Send,
-    > Connection<Octs>
-{
-    /// Constructor for [Connection].
-    ///
-    /// Returns a [Connection] wrapped in a [Result](io::Result).
-    pub fn new() -> io::Result<Connection<Octs>> {
-        let connection = InnerConnection::new()?;
-        Ok(Self {
-            inner: Arc::new(connection),
-        })
-    }
+//------------ Utility --------------------------------------------------------
 
-    /// Main execution function for [Connection].
-    ///
-    /// This function has to run in the background or together with
-    /// any calls to [query](Self::query) or [Query::get_result].
-    pub async fn run<IO: AsyncReadExt + AsyncWriteExt + Unpin>(
-        &self,
-        io: IO,
-    ) -> Option<()> {
-        self.inner.run(io).await
-    }
-
-    /// Start a DNS request.
-    ///
-    /// This function takes a precomposed message as a parameter and
-    /// returns a [Query] object wrapped in a [Result].
-    async fn query_impl(
-        &self,
-        query_msg: &mut MessageBuilder<StaticCompressor<StreamTarget<Octs>>>,
-    ) -> Result<Query, Error> {
-        let (tx, rx) = oneshot::channel();
-        self.inner.query(tx, query_msg).await?;
-        let msg = &query_msg.as_message();
-        Ok(Query::new(msg, rx))
-    }
-
-    /// Start a DNS request but do not check if the reply matches the request.
-    ///
-    /// This function is similar to [Self::query]. Not checking if the reply
-    /// match the request avoids having to keep the request around.
-    pub async fn query_no_check(
-        &self,
-        query_msg: &mut MessageBuilder<StaticCompressor<StreamTarget<Octs>>>,
-    ) -> Result<QueryNoCheck, Error> {
-        let (tx, rx) = oneshot::channel();
-        self.inner.query(tx, query_msg).await?;
-        Ok(QueryNoCheck::new(rx))
-    }
-}
-
-impl<
-        Octs: AsMut<[u8]>
-            + AsRef<[u8]>
-            + Clone
-            + Composer
-            + Debug
-            + OctetsBuilder
-            + Send,
-    > QueryMessage<Query, Octs> for Connection<Octs>
-{
-    fn query<'a>(
-        &'a self,
-        query_msg: &'a mut MessageBuilder<
-            StaticCompressor<StreamTarget<Octs>>,
-        >,
-    ) -> Pin<Box<dyn Future<Output = Result<Query, Error>> + Send + '_>> {
-        return Box::pin(self.query_impl(query_msg));
-    }
-}
-
-impl Query {
-    /// Constructor for [Query], takes a DNS query and a receiver for the
-    /// reply.
-    fn new<Octs: Octets>(
-        query_msg: &Message<Octs>,
-        receiver: oneshot::Receiver<ChanResp>,
-    ) -> Query {
-        let msg_ref: &[u8] = query_msg.as_ref();
-        let vec = msg_ref.to_vec();
-        let msg = Message::from_octets(vec).unwrap();
-        Self {
-            query_msg: msg,
-            state: QueryState::Busy(receiver),
-        }
-    }
-
-    /// Get the result of a DNS query.
-    ///
-    /// This function returns the reply to a DNS query wrapped in a
-    /// [Result].
-    pub async fn get_result_impl(&mut self) -> Result<Message<Bytes>, Error> {
-        match self.state {
-            QueryState::Busy(ref mut receiver) => {
-                let res = receiver.await;
-                self.state = QueryState::Done;
-                if res.is_err() {
-                    // Assume receive error
-                    return Err(Error::StreamReceiveError);
-                }
-                let res = res.unwrap();
-
-                // clippy seems to be wrong here. Replacing
-                // the following with 'res?;' doesn't work
-                #[allow(clippy::question_mark)]
-                if let Err(err) = res {
-                    return Err(err);
-                }
-
-                let resp = res.unwrap();
-                let msg = resp.reply;
-
-                if !is_answer_ignore_id(&msg, &self.query_msg) {
-                    return Err(Error::WrongReplyForQuery);
-                }
-                Ok(msg)
-            }
-            QueryState::Done => {
-                panic!("Already done");
-            }
-        }
-    }
-}
-
-impl GetResult for Query {
-    fn get_result(
-        &mut self,
-    ) -> Pin<
-        Box<dyn Future<Output = Result<Message<Bytes>, Error>> + Send + '_>,
-    > {
-        Box::pin(self.get_result_impl())
-    }
-}
-
-impl QueryNoCheck {
-    /// Constructor for [Query], takes a DNS query and a receiver for the
-    /// reply.
-    fn new(receiver: oneshot::Receiver<ChanResp>) -> QueryNoCheck {
-        Self {
-            state: QueryState::Busy(receiver),
-        }
-    }
-
-    /// Get the result of a DNS query.
-    ///
-    /// This function returns the reply to a DNS query wrapped in a
-    /// [Result].
-    pub async fn get_result(&mut self) -> Result<Message<Bytes>, Error> {
-        match self.state {
-            QueryState::Busy(ref mut receiver) => {
-                let res = receiver.await;
-                self.state = QueryState::Done;
-                if res.is_err() {
-                    // Assume receive error
-                    return Err(Error::StreamReceiveError);
-                }
-                let res = res.unwrap();
-
-                // clippy seems to be wrong here. Replacing
-                // the following with 'res?;' doesn't work
-                #[allow(clippy::question_mark)]
-                if let Err(err) = res {
-                    return Err(err);
-                }
-
-                let resp = res.unwrap();
-                let msg = resp.reply;
-
-                Ok(msg)
-            }
-            QueryState::Done => {
-                panic!("Already done");
-            }
-        }
-    }
-}
-
-/// Add an edns-tcp-keepalive option to a MessageBuilder.
-///
-/// This is surprisingly difficult. We need to copy the original message to
-/// a new MessageBuilder because MessageBuilder has no support for changing the
-/// opt record.
-fn add_tcp_keepalive<Octs: Clone + Composer + OctetsBuilder>(
-    msg: &MessageBuilder<StaticCompressor<StreamTarget<Octs>>>,
-) -> Result<
-    MessageBuilder<StaticCompressor<StreamTarget<Octs>>>,
-    crate::base::message_builder::PushError,
-> {
-    // We can't just insert a new option in an existing
-    // opt record. So we have to create new message and copy records
-    // from the old one. And insert our option while copying the opt
-    // record.
-    let src_clone = msg.clone();
-    let source = Message::from_octets(
-        src_clone.as_target().as_target().as_dgram_slice(),
-    )
-    .unwrap();
-    let target = msg.clone();
-
-    let source = source.question();
-    // Go to additional and back to builder to delete all sections
-    // except for the header
-    let mut target = target.additional().builder().question();
-    for rr in source {
-        let rr = rr.unwrap();
-        target.push(rr)?;
-    }
-    let mut source = source.answer().unwrap();
-    let mut target = target.answer();
-    for rr in &mut source {
-        let rr = rr.unwrap();
-        let rr = rr
-            .into_record::<AllRecordData<_, ParsedDname<_>>>()
-            .unwrap()
-            .unwrap();
-        target.push(rr)?;
-    }
-
-    let mut source = source.next_section().unwrap().unwrap();
-    let mut target = target.authority();
-    for rr in &mut source {
-        let rr = rr.unwrap();
-        let rr = rr
-            .into_record::<AllRecordData<_, ParsedDname<_>>>()
-            .unwrap()
-            .unwrap();
-        target.push(rr)?;
-    }
-
-    let source = source.next_section().unwrap().unwrap();
-    let mut target = target.additional();
-    let mut found_opt_rr = false;
-    for rr in source {
-        let rr = rr.unwrap();
-        if rr.rtype() == Rtype::Opt {
-            found_opt_rr = true;
-            let rr = rr.into_record::<Opt<_>>().unwrap().unwrap();
-            let opt_record = OptRecord::from_record(rr);
-            target
-                .opt(|newopt| {
-                    newopt
-                        .set_udp_payload_size(opt_record.udp_payload_size());
-                    newopt.set_version(opt_record.version());
-                    newopt.set_dnssec_ok(opt_record.dnssec_ok());
-                    for option in opt_record.opt().iter::<AllOptData<_, _>>()
-                    {
-                        let option = option.unwrap();
-                        if let AllOptData::TcpKeepalive(_) = option {
-                            // Ignore existing TcpKeepalive
-                        } else {
-                            newopt.push(&option).unwrap();
-                        }
-                    }
-                    // send an empty keepalive option
-                    newopt.tcp_keepalive(None).unwrap();
-                    Ok(())
-                })
-                .unwrap();
-        } else {
-            let rr = rr
-                .into_record::<AllRecordData<_, ParsedDname<_>>>()
-                .unwrap()
-                .unwrap();
-            target.push(rr)?;
-        }
-    }
-    if !found_opt_rr {
-        // send an empty keepalive option
-        target.opt(|opt| opt.tcp_keepalive(None))?;
-    }
-
-    // It would be nice to use .builder() here. But that one deletes all
-    // section. We have to resort to .as_builder() which gives a
-    // reference and then .clone()
-    Ok(target.as_builder().clone())
+/// Add an edns-tcp-keepalive option to a BaseMessageBuilder.
+fn add_tcp_keepalive<BMB: BaseMessageBuilder>(
+    msg: &mut BMB,
+) -> Result<(), Error> {
+    msg.add_opt(OptTypes::TypeTcpKeepalive(TcpKeepalive::new(None)));
+    Ok(())
 }
 
 /// Check if a DNS reply match the query. Ignore whether id fields match.
@@ -1063,4 +1016,17 @@ fn is_answer_ignore_id<
     } else {
         reply.question() == query.question()
     }
+}
+
+/// Check if config is valid.
+fn check_config(config: &Config) -> Result<(), Error> {
+    if config.response_timeout < MIN_RESPONSE_TIMEOUT
+        || config.response_timeout > MAX_RESPONSE_TIMEOUT
+    {
+        return Err(Error::OctetStreamConfigError(Arc::new(
+            std::io::Error::new(ErrorKind::Other, "response_timeout"),
+        )));
+    }
+
+    Ok(())
 }

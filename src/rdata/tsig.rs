@@ -6,7 +6,7 @@
 
 use crate::base::cmp::CanonicalOrd;
 use crate::base::iana::{Rtype, TsigRcode};
-use crate::base::name::{Dname, ParsedDname, PushError, ToDname};
+use crate::base::name::{FlattenInto, ParsedDname, ToDname};
 use crate::base::rdata::{
     ComposeRecordData, LongRecordData, ParseRecordData, RecordData
 };
@@ -14,7 +14,7 @@ use crate::base::wire::{Compose, Composer, Parse, ParseError};
 use crate::utils::base64;
 use core::cmp::Ordering;
 use core::{fmt, hash};
-use octseq::builder::{EmptyBuilder, FromBuilder, OctetsBuilder};
+use octseq::builder::OctetsBuilder;
 use octseq::octets::{Octets, OctetsFrom, OctetsInto};
 use octseq::parse::Parser;
 #[cfg(feature = "std")]
@@ -261,37 +261,23 @@ impl<O, N> Tsig<O, N> {
             )
         })
     }
-}
 
-impl<Octs, NOcts> Tsig<Octs, ParsedDname<NOcts>> {
-    pub fn flatten_into<Target>(
+    pub(super) fn flatten<TOcts, TName>(
         self,
-    ) -> Result<Tsig<Target, Dname<Target>>, PushError>
+    ) -> Result<Tsig<TOcts, TName>, TOcts::Error>
     where
-        NOcts: Octets,
-        Target: OctetsFrom<Octs>,
-        Target: for<'a> OctetsFrom<NOcts::Range<'a>> + FromBuilder,
-        <Target as FromBuilder>::Builder: EmptyBuilder,
+        TOcts: OctetsFrom<O>,
+        N: FlattenInto<TName, AppendError = TOcts::Error>,
     {
-        let Self {
-            algorithm,
-            time_signed,
-            fudge,
-            mac,
-            original_id,
-            error,
-            other,
-        } = self;
-
         Ok(unsafe {
             Tsig::new_unchecked(
-                algorithm.flatten_into()?,
-                time_signed,
-                fudge,
-                mac.try_octets_into().map_err(Into::into)?,
-                original_id,
-                error,
-                other.try_octets_into().map_err(Into::into)?,
+                self.algorithm.try_flatten_into()?,
+                self.time_signed,
+                self.fudge,
+                self.mac.try_octets_into()?,
+                self.original_id,
+                self.error,
+                self.other.try_octets_into()?,
             )
         })
     }
@@ -318,7 +304,7 @@ impl<Octs> Tsig<Octs, ParsedDname<Octs>> {
     }
 }
 
-//--- OctetsFrom
+//--- OctetsFrom and FlattenInto
 
 impl<Octs, SrcOctets, Name, SrcName> OctetsFrom<Tsig<SrcOctets, SrcName>>
     for Tsig<Octs, Name>
@@ -345,6 +331,22 @@ where
         })
     }
 }
+
+impl<Octs, TOcts, Name, TName> FlattenInto<Tsig<TOcts, TName>>
+    for Tsig<Octs, Name>
+where
+    TOcts: OctetsFrom<Octs>,
+    Name: FlattenInto<TName, AppendError = TOcts::Error>
+{
+    type AppendError = TOcts::Error;
+
+    fn try_flatten_into(
+        self
+    ) -> Result<Tsig<TOcts, TName>, Self::AppendError > {
+        self.flatten()
+    }
+}
+
 
 //--- PartialEq and Eq
 
@@ -607,6 +609,7 @@ impl Time48 {
     /// too far in the future to fit into this type. For a correctly set
     /// clock, this will happen in December 8,921,556, so should be fine.
     #[cfg(feature = "std")]
+    #[must_use]
     pub fn now() -> Time48 {
         Self::from_u64(
             SystemTime::now()
@@ -620,6 +623,7 @@ impl Time48 {
     ///
     /// The upper 16 bits of the arument must be zero or else this function
     /// panics. This is also why we don’t implement `From`.
+    #[must_use]
     pub fn from_u64(value: u64) -> Self {
         assert!(value & 0xFFFF_0000_0000_0000 == 0);
         Time48(value)
@@ -647,6 +651,7 @@ impl Time48 {
     /// Converts a value into its wire format.
     ///
     /// Returns the octets of the encoded value in network byte order.
+    #[must_use]
     pub fn into_octets(self) -> [u8; 6] {
         let mut res = [0u8; 6];
         res[0] = (self.0 >> 40) as u8;
@@ -662,13 +667,10 @@ impl Time48 {
     ///
     /// Returns `true` iff `other` is at most `fudge` seconds before or after
     /// this value’s time.
+    #[must_use]
     pub fn eq_fudged(self, other: Self, fudge: u64) -> bool {
         self.0.saturating_sub(fudge) <= other.0
             && self.0.saturating_add(fudge) >= other.0
-    }
-
-    pub fn flatten_into(self) -> Result<Self, PushError> {
-        Ok(self)
     }
 
     pub fn parse<Octs: AsRef<[u8]> + ?Sized>(
@@ -715,6 +717,7 @@ mod test {
     use std::vec::Vec;
 
     #[test]
+    #[allow(clippy::redundant_closure)] // lifetimes ...
     fn tsig_compose_parse_scan() {
         let rdata = Tsig::new(
             Dname::<Vec<u8>>::from_str("key.example.com.").unwrap(),

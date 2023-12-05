@@ -56,6 +56,7 @@ impl ClientSubnet {
     /// illegal values. That is, it limit the prefix lengths given to a number
     /// meaningful for the address family. It will also set all bits not
     /// covered by the source prefix length in the address to zero.
+    #[must_use]
     pub fn new(
         source_prefix_len: u8,
         scope_prefix_len: u8,
@@ -76,6 +77,7 @@ impl ClientSubnet {
     ///
     /// The source prefix length is the prefix length as specified by the
     /// client in a query.
+    #[must_use]
     pub fn source_prefix_len(&self) -> u8 {
         self.source_prefix_len
     }
@@ -84,11 +86,13 @@ impl ClientSubnet {
     ///
     /// The scope prefix length is the prefix length used by the server for
     /// its answer.
+    #[must_use]
     pub fn scope_prefix_len(&self) -> u8 {
         self.scope_prefix_len
     }
 
     /// Returns the address.
+    #[must_use]
     pub fn addr(&self) -> IpAddr {
         self.addr
     }
@@ -384,6 +388,7 @@ mod tests {
     check!(prefix_too_long, "192.0.2.0", 100, "192.0.2.0", false);
     
     #[test]
+    #[allow(clippy::redundant_closure)] // lifetimes ...
     fn client_subnet_compose_parse() {
         test_option_compose_parse(
             &ClientSubnet::new(4, 6, IpAddr::from_str("127.0.0.1").unwrap()),

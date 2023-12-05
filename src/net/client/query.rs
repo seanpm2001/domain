@@ -8,9 +8,8 @@ use std::boxed::Box;
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
-// use std::sync::Arc;
 
-use crate::base::{Message, MessageBuilder, StaticCompressor, StreamTarget};
+use crate::base::Message;
 use crate::net::client::error::Error;
 
 /// Trait for starting a DNS query based on a message.
@@ -20,12 +19,12 @@ pub trait QueryMessage<GR: GetResult, Octs> {
     /// This function is intended to be cancel safe.
     fn query<'a>(
         &'a self,
-        query_msg: &'a mut MessageBuilder<
-            StaticCompressor<StreamTarget<Octs>>,
-        >,
+        query_msg: &'a Message<Octs>,
     ) -> Pin<Box<dyn Future<Output = Result<GR, Error>> + Send + '_>>;
 }
 
+/*
+// This trait is replaced with QueryMessage3
 /// Trait for starting a DNS query based on a message.
 pub trait QueryMessage2<Octs> {
     /// Query function that takes a message builder type.
@@ -36,6 +35,29 @@ pub trait QueryMessage2<Octs> {
         query_msg: &'a mut MessageBuilder<
             StaticCompressor<StreamTarget<Octs>>,
         >,
+    ) -> Pin<Box<dyn Future<Output = QueryResultOutput> + Send + '_>>;
+}
+*/
+
+/// Trait for starting a DNS query based on a message.
+pub trait QueryMessage3<Octs> {
+    /// Query function that takes a message type.
+    ///
+    /// This function is intended to be cancel safe.
+    fn query<'a>(
+        &'a self,
+        query_msg: &'a Message<Octs>,
+    ) -> Pin<Box<dyn Future<Output = QueryResultOutput> + Send + '_>>;
+}
+
+/// Trait for starting a DNS query based on a base message builder.
+pub trait QueryMessage4<BMB> {
+    /// Query function that takes a BaseMessageBuilder type.
+    ///
+    /// This function is intended to be cancel safe.
+    fn query<'a>(
+        &'a self,
+        query_msg: &'a BMB,
     ) -> Pin<Box<dyn Future<Output = QueryResultOutput> + Send + '_>>;
 }
 

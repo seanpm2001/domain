@@ -1,6 +1,6 @@
 # Change Log
 
-## Unreleased next version
+## Unrelease next version
 
 Breaking changes
 
@@ -9,6 +9,37 @@ New
 Bug fixes
 
 Other changes
+
+
+## 0.9.0
+
+Released 2023-09-18.
+
+Breaking changes
+
+* Move the `flatten_into` method for converting domain names into a
+  straight, flat form into a new `FlattenInto` trait. This trait is only
+  implemented for types that actually are or contain domain names. ([#216])
+* Marked various methods and functions that return values without side
+  effects as `#[must_use]`. ([#228] by [@WhyNotHugo])
+* Changed the signature of `FoundSrvs::merge` to use a non-mut `other`.
+  ([#232])
+* The minimum Rust version is now 1.67. ([#235])
+
+New
+
+* Added support for the ZONEMD record type. ([#229] by [@xofyarg])
+* Re-exported the _octseq_ crate as `dep::octseq`. ([#230])
+* Added a blanket impl for mut refs to `Composer`. ([#231] by [@xofyarg])
+
+[#216]: https://github.com/NLnetLabs/domain/pull/216
+[#229]: https://github.com/NLnetLabs/domain/pull/229
+[#230]: https://github.com/NLnetLabs/domain/pull/230
+[#231]: https://github.com/NLnetLabs/domain/pull/231
+[#232]: https://github.com/NLnetLabs/domain/pull/232
+[#235]: https://github.com/NLnetLabs/domain/pull/235
+[@WhyNotHugo]: https://github.com/WhyNotHugo
+[@xofyarg]: https://github.com/xofyarg
 
 
 ## 0.8.1

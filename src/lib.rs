@@ -49,6 +49,8 @@
 //!   Experimental reading and writing of zone files, i.e., the textual
 //!   representation of DNS data.
 //!
+//! Finally, the [dep] module contains re-exports of some important
+//! dependencies to help avoid issues with multiple versions of a crate.
 //!
 //! # Reference of Feature Flags
 //!
@@ -127,6 +129,7 @@ extern crate std;
 extern crate core;
 
 pub mod base;
+pub mod dep;
 pub mod net;
 pub mod rdata;
 pub mod resolv;

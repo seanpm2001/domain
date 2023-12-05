@@ -7,94 +7,85 @@
 // - handle shutdown
 
 use bytes::Bytes;
-use octseq::OctetsBuilder;
 use std::boxed::Box;
 use std::fmt::Debug;
 use std::future::Future;
-use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::base::wire::Composer;
-use crate::base::{Message, MessageBuilder, StaticCompressor, StreamTarget};
+use crate::base::Message;
+use crate::net::client::base_message_builder::BaseMessageBuilder;
 use crate::net::client::error::Error;
 use crate::net::client::multi_stream;
-use crate::net::client::query::{GetResult, QueryMessage, QueryMessage2};
-use crate::net::client::tcp_factory::TcpConnFactory;
+use crate::net::client::query::{GetResult, QueryMessage4};
+use crate::net::client::tcp_conn_stream::TcpConnStream;
 use crate::net::client::udp;
 
-/// DNS transport connection that first issue a query over a UDP transport and
-/// falls back to TCP if the reply is truncated.
-#[derive(Clone)]
-pub struct Connection<Octs: Debug + OctetsBuilder> {
-    /// Reference to the real object that provides the connection.
-    inner: Arc<InnerConnection<Octs>>,
+//------------ Config ---------------------------------------------------------
+
+/// Configuration for an octet_stream transport connection.
+#[derive(Clone, Debug, Default)]
+pub struct Config {
+    /// Configuration for the UDP transport.
+    pub udp: Option<udp::Config>,
+
+    /// Configuration for the multi_stream (TCP) transport.
+    pub multi_stream: Option<multi_stream::Config>,
 }
 
-impl<Octs: Clone + Composer + Debug + OctetsBuilder + Send + 'static>
-    Connection<Octs>
-{
+//------------ Connection -----------------------------------------------------
+
+/// DNS transport connection that first issues a query over a UDP transport and
+/// falls back to TCP if the reply is truncated.
+#[derive(Clone)]
+pub struct Connection<BMB> {
+    /// Reference to the real object that provides the connection.
+    inner: Arc<InnerConnection<BMB>>,
+}
+
+impl<BMB: BaseMessageBuilder + Clone + 'static> Connection<BMB> {
     /// Create a new connection.
-    pub fn new(remote_addr: SocketAddr) -> io::Result<Connection<Octs>> {
-        let connection = InnerConnection::new(remote_addr)?;
+    pub fn new(
+        config: Option<Config>,
+        remote_addr: SocketAddr,
+    ) -> Result<Self, Error> {
+        let config = match config {
+            Some(config) => {
+                check_config(&config)?;
+                config
+            }
+            None => Default::default(),
+        };
+        let connection = InnerConnection::new(config, remote_addr)?;
         Ok(Self {
             inner: Arc::new(connection),
         })
     }
 
     /// Worker function for a connection object.
-    pub async fn run(&self) -> Option<()> {
-        self.inner.run().await
+    pub fn run(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send>> {
+        self.inner.run()
     }
 
-    /// Start a query.
-    pub async fn query_impl(
+    /// Start a query for the QueryMessage4 trait.
+    async fn query_impl4(
         &self,
-        query_msg: &mut MessageBuilder<StaticCompressor<StreamTarget<Octs>>>,
-    ) -> Result<Query<Octs>, Error> {
-        self.inner.query(query_msg).await
-    }
-
-    /// Start a query for the QueryMessage2 trait.
-    async fn query_impl2(
-        &self,
-        query_msg: &mut MessageBuilder<StaticCompressor<StreamTarget<Octs>>>,
+        query_msg: &BMB,
     ) -> Result<Box<dyn GetResult + Send>, Error> {
         let gr = self.inner.query(query_msg).await?;
         Ok(Box::new(gr))
     }
 }
 
-impl<Octs: Clone + Composer + Debug + OctetsBuilder + Send + 'static>
-    QueryMessage<Query<Octs>, Octs> for Connection<Octs>
+impl<BMB: BaseMessageBuilder + Clone + 'static> QueryMessage4<BMB>
+    for Connection<BMB>
 {
     fn query<'a>(
         &'a self,
-        query_msg: &'a mut MessageBuilder<
-            StaticCompressor<StreamTarget<Octs>>,
-        >,
-    ) -> Pin<Box<dyn Future<Output = Result<Query<Octs>, Error>> + Send + '_>>
-    {
-        return Box::pin(self.query_impl(query_msg));
-    }
-}
-
-impl<
-        Octs: AsRef<[u8]>
-            + Clone
-            + Composer
-            + Debug
-            + OctetsBuilder
-            + Send
-            + 'static,
-    > QueryMessage2<Octs> for Connection<Octs>
-{
-    fn query<'a>(
-        &'a self,
-        query_msg: &'a mut MessageBuilder<
-            StaticCompressor<StreamTarget<Octs>>,
-        >,
+        query_msg: &'a BMB,
     ) -> Pin<
         Box<
             dyn Future<Output = Result<Box<dyn GetResult + Send>, Error>>
@@ -102,61 +93,53 @@ impl<
                 + '_,
         >,
     > {
-        return Box::pin(self.query_impl2(query_msg));
+        return Box::pin(self.query_impl4(query_msg));
     }
 }
 
+//------------ Query ----------------------------------------------------------
+
 /// Object that contains the current state of a query.
 #[derive(Debug)]
-pub struct Query<Octs: Debug + OctetsBuilder> {
+pub struct Query<BMB> {
     /// Reqeust message.
-    query_msg: MessageBuilder<StaticCompressor<StreamTarget<Octs>>>,
+    query_msg: BMB,
 
     /// UDP transport to be used.
     udp_conn: udp::Connection,
 
     /// TCP transport to be used.
-    tcp_conn: multi_stream::Connection<Octs>,
+    tcp_conn: multi_stream::Connection<BMB>,
 
     /// Current state of the query.
-    state: QueryState<Octs>,
+    state: QueryState,
 }
 
 /// Status of the query.
 #[derive(Debug)]
-enum QueryState<Octs: Debug + OctetsBuilder> {
+enum QueryState {
     /// Start a query over the UDP transport.
     StartUdpQuery,
 
     /// Get the result from the UDP transport.
-    GetUdpResult(udp::Query<Octs>),
+    GetUdpResult(Box<dyn GetResult + Send>),
 
     /// Start a query over the TCP transport.
     StartTcpQuery,
 
     /// Get the result from the TCP transport.
-    GetTcpResult(multi_stream::Query<Octs>),
+    GetTcpResult(Box<dyn GetResult + Send>),
 }
 
-impl<
-        Octs: AsMut<[u8]>
-            + AsRef<[u8]>
-            + Clone
-            + Composer
-            + Debug
-            + OctetsBuilder
-            + Send
-            + 'static,
-    > Query<Octs>
-{
+impl<BMB: BaseMessageBuilder + Clone + 'static> Query<BMB> {
     /// Create a new Query object.
     ///
     /// The initial state is to start with a UDP transport.
     fn new(
-        query_msg: &mut MessageBuilder<StaticCompressor<StreamTarget<Octs>>>,
+        query_msg: &BMB,
         udp_conn: udp::Connection,
-        tcp_conn: multi_stream::Connection<Octs>,
-    ) -> Query<Octs> {
+        tcp_conn: multi_stream::Connection<BMB>,
+    ) -> Query<BMB> {
         Query {
             query_msg: query_msg.clone(),
             udp_conn,
@@ -172,9 +155,9 @@ impl<
         loop {
             match &mut self.state {
                 QueryState::StartUdpQuery => {
-                    let mut msg = self.query_msg.clone();
+                    let msg = self.query_msg.clone();
                     let query =
-                        QueryMessage::query(&self.udp_conn, &mut msg).await?;
+                        QueryMessage4::query(&self.udp_conn, &msg).await?;
                     self.state = QueryState::GetUdpResult(query);
                     continue;
                 }
@@ -187,9 +170,9 @@ impl<
                     return Ok(reply);
                 }
                 QueryState::StartTcpQuery => {
-                    let mut msg = self.query_msg.clone();
+                    let msg = self.query_msg.clone();
                     let query =
-                        QueryMessage::query(&self.tcp_conn, &mut msg).await?;
+                        QueryMessage4::query(&self.tcp_conn, &msg).await?;
                     self.state = QueryState::GetTcpResult(query);
                     continue;
                 }
@@ -202,16 +185,8 @@ impl<
     }
 }
 
-impl<
-        Octs: AsMut<[u8]>
-            + AsRef<[u8]>
-            + Clone
-            + Composer
-            + Debug
-            + OctetsBuilder
-            + Send
-            + 'static,
-    > GetResult for Query<Octs>
+impl<BMB: BaseMessageBuilder + Clone + Debug + 'static> GetResult
+    for Query<BMB>
 {
     fn get_result(
         &mut self,
@@ -222,8 +197,10 @@ impl<
     }
 }
 
+//------------ InnerConnection ------------------------------------------------
+
 /// The actual connection object.
-struct InnerConnection<Octs: Debug + OctetsBuilder> {
+struct InnerConnection<BMB> {
     /// The remote address to connect to.
     remote_addr: SocketAddr,
 
@@ -231,19 +208,17 @@ struct InnerConnection<Octs: Debug + OctetsBuilder> {
     udp_conn: udp::Connection,
 
     /// The TCP transport connection.
-    tcp_conn: multi_stream::Connection<Octs>,
+    tcp_conn: multi_stream::Connection<BMB>,
 }
 
-impl<Octs: Clone + Composer + Debug + OctetsBuilder + Send + 'static>
-    InnerConnection<Octs>
-{
+impl<BMB: BaseMessageBuilder + Clone + 'static> InnerConnection<BMB> {
     /// Create a new InnerConnection object.
     ///
     /// Create the UDP and TCP connections. Store the remote address because
     /// run needs it later.
-    fn new(remote_addr: SocketAddr) -> io::Result<InnerConnection<Octs>> {
-        let udp_conn = udp::Connection::new(remote_addr)?;
-        let tcp_conn = multi_stream::Connection::new()?;
+    fn new(config: Config, remote_addr: SocketAddr) -> Result<Self, Error> {
+        let udp_conn = udp::Connection::new(config.udp, remote_addr)?;
+        let tcp_conn = multi_stream::Connection::new(config.multi_stream)?;
 
         Ok(Self {
             remote_addr,
@@ -254,24 +229,29 @@ impl<Octs: Clone + Composer + Debug + OctetsBuilder + Send + 'static>
 
     /// Implementation of the worker function.
     ///
-    /// Create a TCP connection factory and pass that to worker function
+    /// Create a TCP connection stream and pass that to worker function
     /// of the multi_stream object.
-    pub async fn run(&self) -> Option<()> {
-        let tcp_factory = TcpConnFactory::new(self.remote_addr);
-        self.tcp_conn.run(tcp_factory).await
+    fn run(&self) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send>> {
+        let tcp_stream = TcpConnStream::new(self.remote_addr);
+
+        let fut = self.tcp_conn.run(tcp_stream);
+        Box::pin(fut)
     }
 
     /// Implementation of the query function.
     ///
     /// Just create a Query object with the state it needs.
-    async fn query(
-        &self,
-        query_msg: &mut MessageBuilder<StaticCompressor<StreamTarget<Octs>>>,
-    ) -> Result<Query<Octs>, Error> {
+    async fn query(&self, query_msg: &BMB) -> Result<Query<BMB>, Error> {
         Ok(Query::new(
             query_msg,
             self.udp_conn.clone(),
             self.tcp_conn.clone(),
         ))
     }
+}
+
+/// Check if config is valid.
+fn check_config(_config: &Config) -> Result<(), Error> {
+    // Nothing to check at the moment.
+    Ok(())
 }

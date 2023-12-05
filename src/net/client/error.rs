@@ -13,6 +13,18 @@ pub enum Error {
     /// Connection was already closed.
     ConnectionClosed,
 
+    /// PushError from MessageBuilder.
+    MessageBuilderPushError,
+
+    /// ParseError from Message.
+    MessageParseError,
+
+    /// octet_stream configuration error.
+    OctetStreamConfigError(Arc<std::io::Error>),
+
+    /// Underlying transport not found in redundant connection
+    RedundantTransportNotFound,
+
     /// Octet sequence too short to be a valid DNS message.
     ShortMessage,
 
@@ -40,6 +52,9 @@ pub enum Error {
     /// Binding a UDP socket gave an error.
     UdpBind(Arc<std::io::Error>),
 
+    /// UDP configuration error.
+    UdpConfigError(Arc<std::io::Error>),
+
     /// Connecting a UDP socket gave an error.
     UdpConnect(Arc<std::io::Error>),
 
@@ -66,6 +81,15 @@ impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
         match self {
             Error::ConnectionClosed => write!(f, "connection closed"),
+            Error::MessageBuilderPushError => {
+                write!(f, "PushError from MessageBuilder")
+            }
+            Error::MessageParseError => write!(f, "ParseError from Message"),
+            Error::OctetStreamConfigError(_) => write!(f, "bad config value"),
+            Error::RedundantTransportNotFound => write!(
+                f,
+                "Underlying transport not found in redundant connection"
+            ),
             Error::ShortMessage => {
                 write!(f, "octet sequence to short to be a valid message")
             }
@@ -89,6 +113,7 @@ impl Display for Error {
                 write!(f, "unexpected end of data")
             }
             Error::UdpBind(_) => write!(f, "error binding UDP socket"),
+            Error::UdpConfigError(_) => write!(f, "bad config value"),
             Error::UdpConnect(_) => write!(f, "error connecting UDP socket"),
             Error::UdpReceive(_) => {
                 write!(f, "error receiving from UDP socket")
@@ -112,6 +137,10 @@ impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
             Error::ConnectionClosed => None,
+            Error::MessageBuilderPushError => None,
+            Error::MessageParseError => None,
+            Error::OctetStreamConfigError(e) => Some(e),
+            Error::RedundantTransportNotFound => None,
             Error::ShortMessage => None,
             Error::StreamIdleTimeout => None,
             Error::StreamReceiveError => None,
@@ -121,6 +150,7 @@ impl error::Error for Error {
             Error::StreamWriteError(e) => Some(e),
             Error::StreamUnexpectedEndOfData => None,
             Error::UdpBind(e) => Some(e),
+            Error::UdpConfigError(e) => Some(e),
             Error::UdpConnect(e) => Some(e),
             Error::UdpReceive(e) => Some(e),
             Error::UdpSend(e) => Some(e),

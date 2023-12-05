@@ -34,11 +34,13 @@ pub struct TcpKeepalive(Option<IdleTimeout>);
 
 impl TcpKeepalive {
     /// Creates a new value from an optional idle timeout.
+    #[must_use]
     pub fn new(timeout: Option<IdleTimeout>) -> Self {
         TcpKeepalive(timeout)
     }
 
     /// Returns the idle timeout.
+    #[must_use]
     pub fn timeout(self) -> Option<IdleTimeout> {
         self.0
     }
@@ -225,13 +227,16 @@ mod test {
     use super::super::test::test_option_compose_parse;
     
     #[test]
+    #[allow(clippy::redundant_closure)] // lifetimes ...
     fn tcp_keepalive_compose_parse_none() {
         test_option_compose_parse(
             &TcpKeepalive::new(None),
             |parser| TcpKeepalive::parse(parser)
         );
     }
+
     #[test]
+    #[allow(clippy::redundant_closure)] // lifetimes ...
     fn tcp_keepalive_compose_parse_some() {
         test_option_compose_parse(
             &TcpKeepalive::new(Some(12.into())),

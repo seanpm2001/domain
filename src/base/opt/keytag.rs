@@ -81,6 +81,7 @@ impl KeyTag<[u8]> {
     /// The caller needs to ensure that `slice` contains a valid key tag. The
     /// length needs to be an even number of octets and no longer than
     /// 65,536 octets.
+    #[must_use]
     pub unsafe fn from_slice_unchecked(slice: &[u8]) -> &Self {
         &*(slice as *const [u8] as *const Self)
     }
@@ -349,6 +350,7 @@ mod test {
     use super::super::test::test_option_compose_parse;
     
     #[test]
+    #[allow(clippy::redundant_closure)] // lifetimes ...
     fn nsid_compose_parse() {
         test_option_compose_parse(
             &KeyTag::from_octets("fooo").unwrap(),

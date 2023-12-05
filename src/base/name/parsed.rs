@@ -8,11 +8,13 @@ use super::super::wire::{FormError, ParseError};
 use super::dname::Dname;
 use super::label::{Label, LabelTypeError};
 use super::relative::RelativeDname;
-use super::traits::{ToDname, ToLabelIter};
-use super::PushError;
+use super::traits::{FlattenInto, ToDname, ToLabelIter};
 use core::{cmp, fmt, hash};
-use octseq::builder::{EmptyBuilder, FromBuilder};
-use octseq::octets::{Octets, OctetsFrom};
+use octseq::builder::{
+    BuilderAppendError, EmptyBuilder, FreezeBuilder, FromBuilder,
+    OctetsBuilder,
+};
+use octseq::octets::Octets;
 use octseq::parse::Parser;
 
 //------------ ParsedDname ---------------------------------------------------
@@ -104,6 +106,7 @@ impl<Octs> ParsedDname<Octs> {
 }
 
 impl<'a, Octs: Octets + ?Sized> ParsedDname<&'a Octs> {
+    #[must_use]
     pub fn deref_octets(&self) -> ParsedDname<Octs::Range<'a>> {
         ParsedDname {
             octets: self.octets.range(..),
@@ -176,7 +179,7 @@ impl<Octs: AsRef<[u8]>> ParsedDname<Octs> {
         let range = {
             let mut parser = self.parser();
             let len = loop {
-                match LabelType::peek(&mut parser).unwrap() {
+                match LabelType::peek(&parser).unwrap() {
                     LabelType::Normal(0) => {
                         unreachable!()
                     }
@@ -207,7 +210,7 @@ impl<Octs: AsRef<[u8]>> ParsedDname<Octs> {
         let (pos, len) = {
             let mut parser = self.parser();
             let len = loop {
-                match LabelType::peek(&mut parser).unwrap() {
+                match LabelType::peek(&parser).unwrap() {
                     LabelType::Normal(0) => {
                         unreachable!()
                     }
@@ -222,28 +225,6 @@ impl<Octs: AsRef<[u8]>> ParsedDname<Octs> {
         self.name_len -= len;
         self.pos = pos;
         true
-    }
-}
-
-impl<Octs: Octets> ParsedDname<Octs> {
-    /// Flatten `ParsedDname` into a `Dname` in case it is compressed,
-    /// otherwise cheap copy the underlying octets.
-    pub fn flatten_into<Target>(self) -> Result<Dname<Target>, PushError>
-    where
-        Target: for<'a> OctetsFrom<Octs::Range<'a>> + FromBuilder,
-        <Target as FromBuilder>::Builder: EmptyBuilder,
-    {
-        if self.is_compressed() {
-            self.to_dname()
-        } else {
-            let range = self
-                .parser()
-                .parse_octets(self.name_len.into())
-                .map_err(|_| PushError::ShortBuf)?;
-            let octets = Target::try_octets_from(range)
-                .map_err(|_| PushError::ShortBuf)?;
-            Ok(unsafe { Dname::from_octets_unchecked(octets) })
-        }
     }
 }
 
@@ -398,6 +379,29 @@ impl<Octs: AsRef<[u8]>> From<Dname<Octs>> for ParsedDname<Octs> {
             name_len,
             compressed: false,
         }
+    }
+}
+
+//--- FlattenInto
+
+impl<Octs, Target> FlattenInto<Dname<Target>> for ParsedDname<Octs>
+where
+    Octs: Octets,
+    Target: FromBuilder,
+    <Target as FromBuilder>::Builder: EmptyBuilder,
+{
+    type AppendError = BuilderAppendError<Target>;
+
+    fn try_flatten_into(self) -> Result<Dname<Target>, Self::AppendError> {
+        let mut builder =
+            Target::Builder::with_capacity(self.compose_len().into());
+        if let Some(slice) = self.as_flat_slice() {
+            builder.append_slice(slice)?;
+        } else {
+            self.iter_labels()
+                .try_for_each(|label| label.compose(&mut builder))?;
+        }
+        Ok(unsafe { Dname::from_octets_unchecked(builder.freeze()) })
     }
 }
 
@@ -657,7 +661,7 @@ impl LabelType {
 
     /// Returns the label type at the beginning of `parser` without advancing.
     pub fn peek<Ref: AsRef<[u8]> + ?Sized>(
-        parser: &mut Parser<Ref>,
+        parser: &Parser<Ref>,
     ) -> Result<Self, ParseError> {
         let ltype = parser.peek(1)?[0];
         match ltype {

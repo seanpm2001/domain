@@ -7,7 +7,6 @@
 use super::dnssec::RtypeBitmap;
 use crate::base::cmp::CanonicalOrd;
 use crate::base::iana::{Nsec3HashAlg, Rtype};
-use crate::base::name::PushError;
 use crate::base::rdata::{ComposeRecordData, ParseRecordData, RecordData};
 use crate::base::scan::{
     ConvertSymbols, EntrySymbol, Scan, Scanner, ScannerError,
@@ -116,6 +115,12 @@ impl<Octs> Nsec3<Octs> {
         ))
     }
 
+    pub(super) fn flatten<Target: OctetsFrom<Octs>>(
+        self,
+    ) -> Result<Nsec3<Target>, Target::Error> {
+        self.convert_octets()
+    }
+
     pub fn scan<S: Scanner<Octets = Octs>>(
         scanner: &mut S,
     ) -> Result<Self, S::Error> {
@@ -147,30 +152,6 @@ impl<Octs: AsRef<[u8]>> Nsec3<Octs> {
             salt,
             next_owner,
             types,
-        ))
-    }
-}
-
-impl<SrcOcts> Nsec3<SrcOcts> {
-    pub fn flatten_into<Octs>(self) -> Result<Nsec3<Octs>, PushError>
-    where
-        Octs: OctetsFrom<SrcOcts>,
-    {
-        let Self {
-            hash_algorithm,
-            flags,
-            iterations,
-            salt,
-            next_owner,
-            types,
-        } = self;
-        Ok(Nsec3::new(
-            hash_algorithm,
-            flags,
-            iterations,
-            salt.try_octets_into().map_err(Into::into)?,
-            next_owner.try_octets_into().map_err(Into::into)?,
-            types.try_octets_into().map_err(Into::into)?,
         ))
     }
 }
@@ -451,6 +432,12 @@ impl<Octs> Nsec3param<Octs> {
         ))
     }
 
+    pub(super) fn flatten<Target: OctetsFrom<Octs>>(
+        self,
+    ) -> Result<Nsec3param<Target>, Target::Error> {
+        self.convert_octets()
+    }
+
     pub fn parse<'a, Src: Octets<Range<'a> = Octs> + ?Sized>(
         parser: &mut Parser<'a, Src>,
     ) -> Result<Self, ParseError> {
@@ -470,26 +457,6 @@ impl<Octs> Nsec3param<Octs> {
             u8::scan(scanner)?,
             u16::scan(scanner)?,
             Nsec3Salt::scan(scanner)?,
-        ))
-    }
-}
-
-impl<SrcOcts> Nsec3param<SrcOcts> {
-    pub fn flatten_into<Octs>(self) -> Result<Nsec3param<Octs>, PushError>
-    where
-        Octs: OctetsFrom<SrcOcts>,
-    {
-        let Self {
-            hash_algorithm,
-            flags,
-            iterations,
-            salt,
-        } = self;
-        Ok(Nsec3param::new(
-            hash_algorithm,
-            flags,
-            iterations,
-            salt.try_octets_into().map_err(Into::into)?,
         ))
     }
 }
@@ -704,6 +671,7 @@ impl Nsec3Salt<()> {
 
 impl<Octs: ?Sized> Nsec3Salt<Octs> {
     /// Creates an empty salt value.
+    #[must_use]
     pub fn empty() -> Self
     where
         Octs: From<&'static [u8]>,
@@ -1484,6 +1452,7 @@ mod test {
     use std::vec::Vec;
 
     #[test]
+    #[allow(clippy::redundant_closure)] // lifetimes ...
     fn nsec3_compose_parse_scan() {
         let mut rtype = RtypeBitmapBuilder::new_vec();
         rtype.add(Rtype::A).unwrap();
@@ -1506,6 +1475,7 @@ mod test {
     }
 
     #[test]
+    #[allow(clippy::redundant_closure)] // lifetimes ...
     fn nsec3param_compose_parse_scan() {
         let rdata = Nsec3param::new(
             Nsec3HashAlg::Sha1,

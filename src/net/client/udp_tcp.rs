@@ -15,11 +15,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::base::Message;
-use crate::net::client::base_message_builder::BaseMessageBuilder;
+use crate::net::client::compose_request::ComposeRequest;
 use crate::net::client::error::Error;
 use crate::net::client::multi_stream;
-use crate::net::client::query::{GetResult, QueryMessage4};
-use crate::net::client::tcp_conn_stream::TcpConnStream;
+use crate::net::client::request::{GetResponse, Request};
+use crate::net::client::tcp_connect::TcpConnect;
 use crate::net::client::udp;
 
 //------------ Config ---------------------------------------------------------
@@ -44,7 +44,7 @@ pub struct Connection<BMB> {
     inner: Arc<InnerConnection<BMB>>,
 }
 
-impl<BMB: BaseMessageBuilder + Clone + 'static> Connection<BMB> {
+impl<CR: ComposeRequest + Clone + 'static> Connection<CR> {
     /// Create a new connection.
     pub fn new(
         config: Option<Config>,
@@ -70,40 +70,38 @@ impl<BMB: BaseMessageBuilder + Clone + 'static> Connection<BMB> {
         self.inner.run()
     }
 
-    /// Start a query for the QueryMessage4 trait.
-    async fn query_impl4(
+    /// Start a request for the Request trait.
+    async fn request_impl(
         &self,
-        query_msg: &BMB,
-    ) -> Result<Box<dyn GetResult + Send>, Error> {
-        let gr = self.inner.query(query_msg).await?;
+        request_msg: &CR,
+    ) -> Result<Box<dyn GetResponse + Send>, Error> {
+        let gr = self.inner.request(request_msg).await?;
         Ok(Box::new(gr))
     }
 }
 
-impl<BMB: BaseMessageBuilder + Clone + 'static> QueryMessage4<BMB>
-    for Connection<BMB>
-{
-    fn query<'a>(
+impl<CR: ComposeRequest + Clone + 'static> Request<CR> for Connection<CR> {
+    fn request<'a>(
         &'a self,
-        query_msg: &'a BMB,
+        request_msg: &'a CR,
     ) -> Pin<
         Box<
-            dyn Future<Output = Result<Box<dyn GetResult + Send>, Error>>
+            dyn Future<Output = Result<Box<dyn GetResponse + Send>, Error>>
                 + Send
                 + '_,
         >,
     > {
-        return Box::pin(self.query_impl4(query_msg));
+        return Box::pin(self.request_impl(request_msg));
     }
 }
 
-//------------ Query ----------------------------------------------------------
+//------------ ReqResp --------------------------------------------------------
 
 /// Object that contains the current state of a query.
 #[derive(Debug)]
-pub struct Query<BMB> {
+pub struct ReqResp<BMB> {
     /// Reqeust message.
-    query_msg: BMB,
+    request_msg: BMB,
 
     /// UDP transport to be used.
     udp_conn: udp::Connection,
@@ -111,89 +109,87 @@ pub struct Query<BMB> {
     /// TCP transport to be used.
     tcp_conn: multi_stream::Connection<BMB>,
 
-    /// Current state of the query.
+    /// Current state of the request.
     state: QueryState,
 }
 
 /// Status of the query.
 #[derive(Debug)]
 enum QueryState {
-    /// Start a query over the UDP transport.
-    StartUdpQuery,
+    /// Start a request over the UDP transport.
+    StartUdpRequest,
 
-    /// Get the result from the UDP transport.
-    GetUdpResult(Box<dyn GetResult + Send>),
+    /// Get the response from the UDP transport.
+    GetUdpResponse(Box<dyn GetResponse + Send>),
 
-    /// Start a query over the TCP transport.
-    StartTcpQuery,
+    /// Start a request over the TCP transport.
+    StartTcpRequest,
 
-    /// Get the result from the TCP transport.
-    GetTcpResult(Box<dyn GetResult + Send>),
+    /// Get the response from the TCP transport.
+    GetTcpResponse(Box<dyn GetResponse + Send>),
 }
 
-impl<BMB: BaseMessageBuilder + Clone + 'static> Query<BMB> {
-    /// Create a new Query object.
+impl<CR: ComposeRequest + Clone + 'static> ReqResp<CR> {
+    /// Create a new ReqResp object.
     ///
     /// The initial state is to start with a UDP transport.
     fn new(
-        query_msg: &BMB,
+        request_msg: &CR,
         udp_conn: udp::Connection,
-        tcp_conn: multi_stream::Connection<BMB>,
-    ) -> Query<BMB> {
-        Query {
-            query_msg: query_msg.clone(),
+        tcp_conn: multi_stream::Connection<CR>,
+    ) -> ReqResp<CR> {
+        Self {
+            request_msg: request_msg.clone(),
             udp_conn,
             tcp_conn,
-            state: QueryState::StartUdpQuery,
+            state: QueryState::StartUdpRequest,
         }
     }
 
-    /// Get the result of a DNS query.
+    /// Get the response of a DNS request.
     ///
     /// This function is cancel safe.
-    async fn get_result_impl(&mut self) -> Result<Message<Bytes>, Error> {
+    async fn get_response_impl(&mut self) -> Result<Message<Bytes>, Error> {
         loop {
             match &mut self.state {
-                QueryState::StartUdpQuery => {
-                    let msg = self.query_msg.clone();
-                    let query =
-                        QueryMessage4::query(&self.udp_conn, &msg).await?;
-                    self.state = QueryState::GetUdpResult(query);
+                QueryState::StartUdpRequest => {
+                    let msg = self.request_msg.clone();
+                    let request = self.udp_conn.request(&msg).await?;
+                    self.state = QueryState::GetUdpResponse(request);
                     continue;
                 }
-                QueryState::GetUdpResult(ref mut query) => {
-                    let reply = query.get_result().await?;
-                    if reply.header().tc() {
-                        self.state = QueryState::StartTcpQuery;
+                QueryState::GetUdpResponse(ref mut request) => {
+                    let response = request.get_response().await?;
+                    if response.header().tc() {
+                        self.state = QueryState::StartTcpRequest;
                         continue;
                     }
-                    return Ok(reply);
+                    return Ok(response);
                 }
-                QueryState::StartTcpQuery => {
-                    let msg = self.query_msg.clone();
-                    let query =
-                        QueryMessage4::query(&self.tcp_conn, &msg).await?;
-                    self.state = QueryState::GetTcpResult(query);
+                QueryState::StartTcpRequest => {
+                    let msg = self.request_msg.clone();
+                    let request = self.tcp_conn.request(&msg).await?;
+                    self.state = QueryState::GetTcpResponse(request);
                     continue;
                 }
-                QueryState::GetTcpResult(ref mut query) => {
-                    let reply = query.get_result().await?;
-                    return Ok(reply);
+                QueryState::GetTcpResponse(ref mut query) => {
+                    let response = query.get_response().await?;
+                    return Ok(response);
                 }
             }
         }
     }
 }
 
-impl<BMB: BaseMessageBuilder + Clone + Debug + 'static> GetResult
-    for Query<BMB>
+impl<CR: ComposeRequest + Clone + Debug + 'static> GetResponse
+    for ReqResp<CR>
 {
-    fn get_result(
+    fn get_response(
         &mut self,
     ) -> Pin<
         Box<dyn Future<Output = Result<Message<Bytes>, Error>> + Send + '_>,
     > {
-        Box::pin(self.get_result_impl())
+        Box::pin(self.get_response_impl())
     }
 }
 
@@ -211,7 +207,7 @@ struct InnerConnection<BMB> {
     tcp_conn: multi_stream::Connection<BMB>,
 }
 
-impl<BMB: BaseMessageBuilder + Clone + 'static> InnerConnection<BMB> {
+impl<CR: ComposeRequest + Clone + 'static> InnerConnection<CR> {
     /// Create a new InnerConnection object.
     ///
     /// Create the UDP and TCP connections. Store the remote address because
@@ -229,21 +225,21 @@ impl<BMB: BaseMessageBuilder + Clone + 'static> InnerConnection<BMB> {
 
     /// Implementation of the worker function.
     ///
-    /// Create a TCP connection stream and pass that to worker function
+    /// Create a TCP connect object and pass that to run function
     /// of the multi_stream object.
     fn run(&self) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send>> {
-        let tcp_stream = TcpConnStream::new(self.remote_addr);
+        let tcp_connect = TcpConnect::new(self.remote_addr);
 
-        let fut = self.tcp_conn.run(tcp_stream);
+        let fut = self.tcp_conn.run(tcp_connect);
         Box::pin(fut)
     }
 
-    /// Implementation of the query function.
+    /// Implementation of the request function.
     ///
-    /// Just create a Query object with the state it needs.
-    async fn query(&self, query_msg: &BMB) -> Result<Query<BMB>, Error> {
-        Ok(Query::new(
-            query_msg,
+    /// Just create a ReqResp object with the state it needs.
+    async fn request(&self, request_msg: &CR) -> Result<ReqResp<CR>, Error> {
+        Ok(ReqResp::new(
+            request_msg,
             self.udp_conn.clone(),
             self.tcp_conn.clone(),
         ))

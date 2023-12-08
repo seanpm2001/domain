@@ -30,11 +30,11 @@ use tokio::time::{sleep_until, Instant};
 
 use crate::base::iana::Rcode;
 use crate::base::Message;
-use crate::net::client::base_message_builder::BaseMessageBuilder;
-use crate::net::client::connection_stream::ConnectionStream;
+use crate::net::client::async_connect::AsyncConnect;
+use crate::net::client::compose_request::ComposeRequest;
 use crate::net::client::error::Error;
 use crate::net::client::octet_stream;
-use crate::net::client::query::{GetResult, QueryMessage4};
+use crate::net::client::request::{GetResponse, Request};
 
 /// Capacity of the channel that transports [ChanReq].
 const DEF_CHAN_CAP: usize = 8;
@@ -56,12 +56,12 @@ pub struct Config {
 
 #[derive(Clone, Debug)]
 /// A DNS over octect streams transport.
-pub struct Connection<BMB> {
+pub struct Connection<CR> {
     /// Reference counted [InnerConnection].
-    inner: Arc<InnerConnection<BMB>>,
+    inner: Arc<InnerConnection<CR>>,
 }
 
-impl<BMB: BaseMessageBuilder + Clone + 'static> Connection<BMB> {
+impl<CR: ComposeRequest + Clone + 'static> Connection<CR> {
     /// Constructor for [Connection].
     ///
     /// Returns a [Connection] wrapped in a [Result](io::Result).
@@ -82,10 +82,10 @@ impl<BMB: BaseMessageBuilder + Clone + 'static> Connection<BMB> {
     /// Main execution function for [Connection].
     ///
     /// This function has to run in the background or together with
-    /// any calls to [query](Self::query) or [Query::get_result].
+    /// any calls to [query](Self::query) or [ReqResp::get_response].
     pub fn run<
-        S: ConnectionStream<IO> + Send + 'static,
-        IO: 'static + AsyncRead + AsyncWrite + Debug + Send + Sync + Unpin,
+        S: AsyncConnect<Connection = C> + Send + 'static,
+        C: 'static + AsyncRead + AsyncWrite + Debug + Send + Sync + Unpin,
     >(
         &self,
         stream: S,
@@ -96,14 +96,14 @@ impl<BMB: BaseMessageBuilder + Clone + 'static> Connection<BMB> {
     /// Start a DNS request.
     ///
     /// This function takes a precomposed message as a parameter and
-    /// returns a [Query] object wrapped in a [Result].
-    async fn query_impl4(
+    /// returns a [ReqResp] object wrapped in a [Result].
+    async fn query_impl(
         &self,
-        query_msg: &BMB,
-    ) -> Result<Box<dyn GetResult + Send>, Error> {
+        query_msg: &CR,
+    ) -> Result<Box<dyn GetResponse + Send>, Error> {
         let (tx, rx) = oneshot::channel();
         self.inner.new_conn(None, tx).await?;
-        let gr = Query::<BMB>::new(self.clone(), query_msg, rx);
+        let gr = ReqResp::<CR>::new(self.clone(), query_msg, rx);
         Ok(Box::new(gr))
     }
 
@@ -116,61 +116,45 @@ impl<BMB: BaseMessageBuilder + Clone + 'static> Connection<BMB> {
     async fn new_conn(
         &self,
         id: u64,
-        tx: oneshot::Sender<ChanResp<BMB>>,
+        tx: oneshot::Sender<ChanResp<CR>>,
     ) -> Result<(), Error> {
         self.inner.new_conn(Some(id), tx).await
     }
 }
 
-/*
-impl<BMB: BaseMessageBuilder, Octs: Clone + Debug + Octets + Send + Sync + 'static>
-    QueryMessage<Query<BMB>, Octs> for Connection<>
-{
-    fn query<'a>(
+impl<CR: ComposeRequest + Clone + 'static> Request<CR> for Connection<CR> {
+    fn request<'a>(
         &'a self,
-        query_msg: &'a Message<Octs>,
-    ) -> Pin<Box<dyn Future<Output = Result<Query<BMB>, Error>> + Send + '_>>
-    {
-        return Box::pin(self.query_impl(query_msg));
-    }
-}
-*/
-
-impl<BMB: BaseMessageBuilder + Clone + 'static> QueryMessage4<BMB>
-    for Connection<BMB>
-{
-    fn query<'a>(
-        &'a self,
-        query_msg: &'a BMB,
+        request_msg: &'a CR,
     ) -> Pin<
         Box<
-            dyn Future<Output = Result<Box<dyn GetResult + Send>, Error>>
+            dyn Future<Output = Result<Box<dyn GetResponse + Send>, Error>>
                 + Send
                 + '_,
         >,
     > {
-        return Box::pin(self.query_impl4(query_msg));
+        return Box::pin(self.query_impl(request_msg));
     }
 }
 
-//------------ Query ----------------------------------------------------------
+//------------ ReqResp --------------------------------------------------------
 
-/// This struct represent an active DNS query.
+/// This struct represent an active DNS request.
 #[derive(Debug)]
-pub struct Query<BMB: BaseMessageBuilder> {
+pub struct ReqResp<CR: ComposeRequest> {
     /// Request message.
     ///
     /// The reply message is compared with the request message to see if
     /// it matches the query.
     // query_msg: Message<Vec<u8>>,
-    query_msg: BMB,
+    request_msg: CR,
 
     /// Current state of the query.
-    state: QueryState<BMB>,
+    state: QueryState<CR>,
 
     /// A multi_octet connection object is needed to request new underlying
     /// octet_stream transport connections.
-    conn: Connection<BMB>,
+    conn: Connection<CR>,
 
     /// id of most recent connection.
     conn_id: u64,
@@ -183,12 +167,12 @@ pub struct Query<BMB: BaseMessageBuilder> {
 
 /// Status of a query. Used in [Query].
 #[derive(Debug)]
-enum QueryState<BMB> {
+enum QueryState<CR> {
     /// Get a octet_stream transport.
-    GetConn(oneshot::Receiver<ChanResp<BMB>>),
+    GetConn(oneshot::Receiver<ChanResp<CR>>),
 
     /// Start a query using the transport.
-    StartQuery(octet_stream::Connection<BMB>),
+    StartQuery(octet_stream::Connection<CR>),
 
     /// Get the result of the query.
     GetResult(octet_stream::QueryNoCheck),
@@ -204,41 +188,42 @@ enum QueryState<BMB> {
 }
 
 /// The reply to a NewConn request.
-type ChanResp<BMB> = Result<ChanRespOk<BMB>, Arc<std::io::Error>>;
+type ChanResp<CR> = Result<ChanRespOk<CR>, Arc<std::io::Error>>;
 
 /// Response to the DNS request sent by [InnerConnection::run] to [Query].
 #[derive(Debug)]
-struct ChanRespOk<BMB> {
+struct ChanRespOk<CR> {
     /// id of this connection.
     id: u64,
 
     /// New octet_stream transport.
-    conn: octet_stream::Connection<BMB>,
+    conn: octet_stream::Connection<CR>,
 }
 
-impl<BMB: BaseMessageBuilder + Clone + 'static> Query<BMB> {
-    /// Constructor for [Query], takes a DNS query and a receiver for the
+impl<CR: ComposeRequest + Clone + 'static> ReqResp<CR> {
+    /// Constructor for [ReqResp], takes a DNS request and a receiver for the
     /// reply.
     fn new(
-        conn: Connection<BMB>,
-        query_msg: &BMB,
-        receiver: oneshot::Receiver<ChanResp<BMB>>,
-    ) -> Query<BMB> {
+        conn: Connection<CR>,
+        request_msg: &CR,
+        receiver: oneshot::Receiver<ChanResp<CR>>,
+    ) -> ReqResp<CR> {
         Self {
             conn,
-            query_msg: query_msg.clone(),
+            request_msg: request_msg.clone(),
             state: QueryState::GetConn(receiver),
             conn_id: 0,
-            //imm_retry_count: 0,
             delayed_retry_count: 0,
         }
     }
 
-    /// Get the result of a DNS query.
+    /// Get the result of a DNS request.
     ///
-    /// This function returns the reply to a DNS query wrapped in a
+    /// This function returns the reply to a DNS request wrapped in a
     /// [Result].
-    pub async fn get_result_impl(&mut self) -> Result<Message<Bytes>, Error> {
+    pub async fn get_response_impl(
+        &mut self,
+    ) -> Result<Message<Bytes>, Error> {
         loop {
             match self.state {
                 QueryState::GetConn(ref mut receiver) => {
@@ -271,7 +256,7 @@ impl<BMB: BaseMessageBuilder + Clone + 'static> Query<BMB> {
                     }
                 }
                 QueryState::StartQuery(ref mut conn) => {
-                    let msg = self.query_msg.clone();
+                    let msg = self.request_msg.clone();
                     let query_res = conn.query_no_check(&msg).await;
                     match query_res {
                         Err(err) => {
@@ -308,9 +293,9 @@ impl<BMB: BaseMessageBuilder + Clone + 'static> Query<BMB> {
                     }
 
                     let msg = reply.expect("error is checked before");
-                    let query_msg = self.query_msg.to_message();
+                    let request_msg = self.request_msg.to_message();
 
-                    if !is_answer_ignore_id(&msg, &query_msg) {
+                    if !is_answer_ignore_id(&msg, &request_msg) {
                         return Err(Error::WrongReplyForQuery);
                     }
                     return Ok(msg);
@@ -334,13 +319,13 @@ impl<BMB: BaseMessageBuilder + Clone + 'static> Query<BMB> {
     }
 }
 
-impl<BMB: BaseMessageBuilder + Clone + 'static> GetResult for Query<BMB> {
-    fn get_result(
+impl<CR: ComposeRequest + Clone + 'static> GetResponse for ReqResp<CR> {
+    fn get_response(
         &mut self,
     ) -> Pin<
         Box<dyn Future<Output = Result<Message<Bytes>, Error>> + Send + '_>,
     > {
-        Box::pin(self.get_result_impl())
+        Box::pin(self.get_response_impl())
     }
 }
 
@@ -348,15 +333,15 @@ impl<BMB: BaseMessageBuilder + Clone + 'static> GetResult for Query<BMB> {
 
 /// The actual implementation of [Connection].
 #[derive(Debug)]
-struct InnerConnection<BMB> {
+struct InnerConnection<CR> {
     /// User configuration values.
     config: Config,
 
     /// [InnerConnection::sender] and [InnerConnection::receiver] are
     /// part of a single channel.
     ///
-    /// Used by [Query] to send requests to [InnerConnection::run].
-    sender: mpsc::Sender<ChanReq<BMB>>,
+    /// Used by [ReqResp] to send requests to [InnerConnection::run].
+    sender: mpsc::Sender<ChanReq<CR>>,
 
     /// receiver part of the channel.
     ///
@@ -364,39 +349,39 @@ struct InnerConnection<BMB> {
     /// [InnerConnection::run].
     /// The Option is to allow [InnerConnection::run] to signal that the
     /// connection is closed.
-    receiver: Mutex<Option<mpsc::Receiver<ChanReq<BMB>>>>,
+    receiver: Mutex<Option<mpsc::Receiver<ChanReq<CR>>>>,
 }
 
 #[derive(Debug)]
 /// A request to [Connection::run] either for a new octet_stream or to
 /// shutdown.
-struct ChanReq<BMB> {
+struct ChanReq<CR> {
     /// A requests consists of a command.
-    cmd: ReqCmd<BMB>,
+    cmd: ReqCmd<CR>,
 }
 
 #[derive(Debug)]
 /// Commands that can be requested.
-enum ReqCmd<BMB> {
+enum ReqCmd<CR> {
     /// Request for a (new) connection.
     ///
     /// The id of the previous connection (if any) is passed as well as a
     /// channel to send the reply.
-    NewConn(Option<u64>, ReplySender<BMB>),
+    NewConn(Option<u64>, ReplySender<CR>),
 
     /// Shutdown command.
     Shutdown,
 }
 
 /// This is the type of sender in [ReqCmd].
-type ReplySender<BMB> = oneshot::Sender<ChanResp<BMB>>;
+type ReplySender<CR> = oneshot::Sender<ChanResp<CR>>;
 
 /// Internal datastructure of [InnerConnection::run] to keep track of
 /// the status of the connection.
 // The types Status and ConnState are only used in InnerConnection
-struct State3<'a, S, IO, BMB> {
+struct State3<'a, S, IO, CR> {
     /// Underlying octet_stream connection.
-    conn_state: SingleConnState3<BMB>,
+    conn_state: SingleConnState3<CR>,
 
     /// Current connection id.
     conn_id: u64,
@@ -415,12 +400,12 @@ struct State3<'a, S, IO, BMB> {
 }
 
 /// State of the current underlying octet_stream transport.
-enum SingleConnState3<BMB> {
+enum SingleConnState3<CR> {
     /// No current octet_stream transport.
     None,
 
     /// Current octet_stream transport.
-    Some(octet_stream::Connection<BMB>),
+    Some(octet_stream::Connection<CR>),
 
     /// State that deals with an error getting a new octet stream from
     /// a connection stream.
@@ -444,7 +429,7 @@ struct ErrorState {
     timeout: Duration,
 }
 
-impl<BMB: BaseMessageBuilder + Clone + 'static> InnerConnection<BMB> {
+impl<CR: ComposeRequest + Clone + 'static> InnerConnection<CR> {
     /// Constructor for [InnerConnection].
     ///
     /// This is the implementation of [Connection::new].
@@ -463,8 +448,8 @@ impl<BMB: BaseMessageBuilder + Clone + 'static> InnerConnection<BMB> {
     /// This function is not async cancellation safe.
     /// Make sure the resulting future does not contain a reference to self.
     pub fn run<
-        S: ConnectionStream<IO> + Send + 'static,
-        IO: 'static + AsyncRead + AsyncWrite + Debug + Send + Sync + Unpin,
+        S: AsyncConnect<Connection = C> + Send + 'static,
+        C: 'static + AsyncRead + AsyncWrite + Debug + Send + Sync + Unpin,
     >(
         &self,
         stream: S,
@@ -481,19 +466,19 @@ impl<BMB: BaseMessageBuilder + Clone + 'static> InnerConnection<BMB> {
     #[rustfmt::skip]
     async fn run_impl<
         'a,
-        S: ConnectionStream<IO> + Send,
-        IO: 'static + AsyncRead + AsyncWrite + Debug + Send + Unpin,
+        S: AsyncConnect<Connection = C> + Send,
+        C: 'static + AsyncRead + AsyncWrite + Debug + Send + Unpin,
     >(
 	config: Config,
         stream: S,
-	opt_receiver: Option<mpsc::Receiver<ChanReq<BMB>>>
+	opt_receiver: Option<mpsc::Receiver<ChanReq<CR>>>
     ) -> Result<(), Error> {
         let mut receiver = {
             opt_receiver.expect("no receiver present?")
         };
-        let mut curr_cmd: Option<ReqCmd<BMB>> = None;
+        let mut curr_cmd: Option<ReqCmd<CR>> = None;
 
-        let mut state = State3::<'a, S, IO, BMB> {
+        let mut state = State3::<'a, S, C, CR> {
             conn_state: SingleConnState3::None,
             conn_id: 0,
             stream,
@@ -505,7 +490,7 @@ impl<BMB: BaseMessageBuilder + Clone + 'static> InnerConnection<BMB> {
 
         let mut do_stream = false;
         let mut stream_fut: Pin<
-            Box<dyn Future<Output = Result<IO, std::io::Error>> + Send>,
+            Box<dyn Future<Output = Result<C, std::io::Error>> + Send>,
         > = Box::pin(stream_nop());
         let mut opt_chan = None;
 
@@ -557,7 +542,7 @@ impl<BMB: BaseMessageBuilder + Clone + 'static> InnerConnection<BMB> {
                             _ = chan.send(resp);
                         } else {
                             opt_chan = Some(chan);
-                            stream_fut = Box::pin(state.stream.next());
+                            stream_fut = Box::pin(state.stream.connect());
                             do_stream = true;
                         }
                     }
@@ -674,7 +659,7 @@ impl<BMB: BaseMessageBuilder + Clone + 'static> InnerConnection<BMB> {
     async fn new_conn(
         &self,
         opt_id: Option<u64>,
-        sender: oneshot::Sender<ChanResp<BMB>>,
+        sender: oneshot::Sender<ChanResp<CR>>,
     ) -> Result<(), Error> {
         let req = ChanReq {
             cmd: ReqCmd::NewConn(opt_id, sender),

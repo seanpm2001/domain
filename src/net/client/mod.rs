@@ -7,15 +7,15 @@
 #![doc = include_str!("../../../examples/client-transports.rs")]
 //! ```
 
-pub mod base_message_builder;
-pub mod bmb;
-pub mod connection_stream;
+pub mod async_connect;
+pub mod compose_request;
 pub mod error;
 pub mod multi_stream;
 pub mod octet_stream;
-pub mod query;
 pub mod redundant;
-pub mod tcp_conn_stream;
-pub mod tls_conn_stream;
+pub mod request;
+pub mod request_message;
+pub mod tcp_connect;
+pub mod tls_connect;
 pub mod udp;
 pub mod udp_tcp;

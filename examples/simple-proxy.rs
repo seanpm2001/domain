@@ -10,13 +10,14 @@ use domain::base::opt::{Opt, OptRecord};
 use domain::base::{
     Message, MessageBuilder, ParsedDname, StaticCompressor, StreamTarget,
 };
-use domain::net::client::base_message_builder::BaseMessageBuilder;
-use domain::net::client::bmb;
+use domain::dep::octseq::Octets;
+use domain::net::client::compose_request::ComposeRequest;
 use domain::net::client::multi_stream;
-use domain::net::client::query::QueryMessage4;
 use domain::net::client::redundant;
-use domain::net::client::tcp_conn_stream::TcpConnStream;
-use domain::net::client::tls_conn_stream::TlsConnStream;
+use domain::net::client::request::Request;
+use domain::net::client::request_message::RequestMessage;
+use domain::net::client::tcp_connect::TcpConnect;
+use domain::net::client::tls_connect::TlsConnect;
 use domain::net::client::udp;
 use domain::net::client::udp_tcp;
 use domain::rdata::AllRecordData;
@@ -27,7 +28,6 @@ use domain::serve::service::{
 };
 use futures::Stream;
 use futures::{future::BoxFuture, FutureExt};
-use octseq::Octets;
 use rustls::ClientConfig;
 use serde::Deserialize;
 use serde::Serialize;
@@ -236,7 +236,7 @@ fn to_stream_target<Octs1: Octets>(
 fn query_service<
     RequestOctets: AsRef<[u8]> + Debug + Octets + Send + Sync + 'static,
 >(
-    conn: impl QueryMessage4<bmb::BMB<RequestOctets>>
+    conn: impl Request<RequestMessage<RequestOctets>>
         + Clone
         + Send
         + Sync
@@ -248,7 +248,7 @@ where
     /// Basic query function for Service.
     fn query<RequestOctets: AsRef<[u8]> + Debug + Octets>(
         message: Message<RequestOctets>,
-        conn: impl QueryMessage4<bmb::BMB<RequestOctets>> + Send + Sync,
+        conn: impl Request<RequestMessage<RequestOctets>> + Send + Sync,
     ) -> Transaction<
         impl Future<Output = Result<CallResult<Vec<u8>>, ServiceError<()>>>,
         impl Stream<Item = Result<CallResult<Vec<u8>>, ServiceError<()>>>,
@@ -262,10 +262,10 @@ where
             // We get a Message, but the client transport needs a
             // BaseMessageBuilder. Convert.
             println!("request {:?}", message);
-            let bmb = bmb::BMB::new(message);
-            println!("request {:?}", bmb);
-            let mut query = conn.query(&bmb).await.unwrap();
-            let reply = query.get_result().await.unwrap();
+            let request_msg = RequestMessage::new(message);
+            println!("request {:?}", request_msg);
+            let mut query = conn.request(&request_msg).await.unwrap();
+            let reply = query.get_response().await.unwrap();
             println!("got reply {:?}", reply);
 
             // Set the ID
@@ -411,23 +411,23 @@ async fn main() {
     // query_service because it lacks Clone.
     let udp_join_handle = match conf.upstream {
         TransportConfig::Redundant(redun_conf) => {
-            let redun = get_redun::<bmb::BMB<VecU8>>(redun_conf).await;
+            let redun = get_redun::<RequestMessage<VecU8>>(redun_conf).await;
             start_service(redun, udpsocket2, buf_source)
         }
         TransportConfig::Tcp(tcp_conf) => {
-            let tcp = get_tcp::<bmb::BMB<VecU8>>(tcp_conf);
+            let tcp = get_tcp::<RequestMessage<VecU8>>(tcp_conf);
             start_service(tcp, udpsocket2, buf_source)
         }
         TransportConfig::Tls(tls_conf) => {
-            let tls = get_tls::<bmb::BMB<VecU8>>(tls_conf);
+            let tls = get_tls::<RequestMessage<VecU8>>(tls_conf);
             start_service(tls, udpsocket2, buf_source)
         }
         TransportConfig::Udp(udp_conf) => {
-            let udp = get_udp::<bmb::BMB<VecU8>>(udp_conf);
+            let udp = get_udp::<RequestMessage<VecU8>>(udp_conf);
             start_service(udp, udpsocket2, buf_source)
         }
         TransportConfig::UdpTcp(udptcp_conf) => {
-            let udptcp = get_udptcp::<bmb::BMB<VecU8>>(udptcp_conf);
+            let udptcp = get_udptcp::<RequestMessage<VecU8>>(udptcp_conf);
             start_service(udptcp, udpsocket2, buf_source)
         }
     };
@@ -437,10 +437,10 @@ async fn main() {
 
 /// Get a redundant transport based on its config
 async fn get_redun<
-    BMB: BaseMessageBuilder + Clone + Debug + Send + Sync + 'static,
+    CR: ComposeRequest + Clone + Debug + Send + Sync + 'static,
 >(
     config: RedundantConfig,
-) -> redundant::Connection<BMB> {
+) -> redundant::Connection<CR> {
     println!("Creating new redundant::Connection");
     let redun = redundant::Connection::new(None).unwrap();
     let redun_run = redun.clone();
@@ -457,17 +457,16 @@ async fn get_redun<
 }
 
 /// Get a TCP transport based on its config
-fn get_tcp<BMB: BaseMessageBuilder + Clone + 'static>(
+fn get_tcp<CR: ComposeRequest + Clone + 'static>(
     config: TcpConfig,
-) -> impl QueryMessage4<BMB> + Clone + Send + Sync {
+) -> impl Request<CR> + Clone + Send + Sync {
     let sockaddr = get_sockaddr(&config.addr, config.port.as_deref(), 53);
-    let tcp_conn_stream = TcpConnStream::new(sockaddr);
+    let tcp_connect = TcpConnect::new(sockaddr);
 
     let conn = multi_stream::Connection::new(None).unwrap();
-    let conn_run = conn.clone();
-
+    let run_fut = conn.run(tcp_connect);
     tokio::spawn(async move {
-        conn_run.run(tcp_conn_stream).await.unwrap();
+        run_fut.await.unwrap();
         println!("run terminated");
     });
 
@@ -475,9 +474,9 @@ fn get_tcp<BMB: BaseMessageBuilder + Clone + 'static>(
 }
 
 /// Get a TLS transport based on its config
-fn get_tls<BMB: BaseMessageBuilder + Clone + 'static>(
+fn get_tls<CR: ComposeRequest + Clone + 'static>(
     config: TlsConfig,
-) -> impl QueryMessage4<BMB> + Clone + Send + Sync {
+) -> impl Request<CR> + Clone + Send + Sync {
     let sockaddr = get_sockaddr(&config.addr, config.port.as_deref(), 853);
 
     let mut root_store = rustls::RootCertStore::empty();
@@ -497,14 +496,12 @@ fn get_tls<BMB: BaseMessageBuilder + Clone + 'static>(
             .with_no_client_auth(),
     );
 
-    let tls_conn_stream =
-        TlsConnStream::new(client_config, &config.servername, sockaddr);
-
+    let tls_connect =
+        TlsConnect::new(client_config, &config.servername, sockaddr);
     let conn = multi_stream::Connection::new(None).unwrap();
-    let conn_run = conn.clone();
-
+    let run_fut = conn.run(tls_connect);
     tokio::spawn(async move {
-        conn_run.run(tls_conn_stream).await.unwrap();
+        run_fut.await.unwrap();
         println!("run terminated");
     });
 
@@ -512,18 +509,18 @@ fn get_tls<BMB: BaseMessageBuilder + Clone + 'static>(
 }
 
 /// Get a UDP-only transport based on its config
-fn get_udp<BMB: BaseMessageBuilder + Clone + 'static>(
+fn get_udp<CR: ComposeRequest + Clone + 'static>(
     config: UdpConfig,
-) -> impl QueryMessage4<BMB> + Clone + Send + Sync {
+) -> impl Request<CR> + Clone + Send + Sync {
     let sockaddr = get_sockaddr(&config.addr, config.port.as_deref(), 53);
 
     udp::Connection::new(None, sockaddr).unwrap()
 }
 
 /// Get a UDP+TCP transport based on its config
-fn get_udptcp<BMB: BaseMessageBuilder + Clone + 'static>(
+fn get_udptcp<CR: ComposeRequest + Clone + 'static>(
     config: UdpTcpConfig,
-) -> impl QueryMessage4<BMB> + Clone + Send + Sync {
+) -> impl Request<CR> + Clone + Send + Sync {
     let sockaddr = get_sockaddr(&config.addr, config.port.as_deref(), 53);
     let conn = udp_tcp::Connection::new(None, sockaddr).unwrap();
     let conn_run = conn.clone();
@@ -536,15 +533,15 @@ fn get_udptcp<BMB: BaseMessageBuilder + Clone + 'static>(
 }
 
 /// Get a transport based on its config
-fn get_transport<BMB: BaseMessageBuilder + Clone + 'static>(
+fn get_transport<CR: ComposeRequest + Clone + 'static>(
     config: TransportConfig,
-) -> BoxFuture<'static, Box<dyn QueryMessage4<BMB> + Send + Sync>> {
+) -> BoxFuture<'static, Box<dyn Request<CR> + Send + Sync>> {
     // We have an indirectly recursive async function. This function calls
     // get_redun which calls this function. The solution is to return a
     // boxed future.
     async move {
         println!("got config {:?}", config);
-        let a: Box<dyn QueryMessage4<BMB> + Send + Sync> = match config {
+        let a: Box<dyn Request<CR> + Send + Sync> = match config {
             TransportConfig::Redundant(redun_conf) => {
                 Box::new(get_redun(redun_conf).await)
             }
@@ -562,7 +559,7 @@ fn get_transport<BMB: BaseMessageBuilder + Clone + 'static>(
 
 /// Start a service based on a transport, a UDP server socket and a buffer
 fn start_service(
-    conn: impl QueryMessage4<bmb::BMB<VecU8>> + Clone + Send + Sync + 'static,
+    conn: impl Request<RequestMessage<VecU8>> + Clone + Send + Sync + 'static,
     socket: UdpSocket,
     buf_source: Arc<VecBufSource>,
 ) -> JoinHandle<Result<(), std::io::Error>> {

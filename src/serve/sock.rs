@@ -82,7 +82,8 @@ impl AsyncAccept for TcpListener {
     type Addr = SocketAddr;
     type Error = io::Error;
     type StreamType = TcpStream;
-    type Stream = futures_util::future::Ready<Result<Self::StreamType, io::Error>>;
+    type Stream =
+        futures_util::future::Ready<Result<Self::StreamType, io::Error>>;
 
     #[allow(clippy::type_complexity)]
     fn poll_accept(

@@ -11,23 +11,22 @@ use domain::base::{
     Message, MessageBuilder, ParsedDname, StaticCompressor, StreamTarget,
 };
 use domain::dep::octseq::Octets;
-use domain::net::client::compose_request::ComposeRequest;
+use domain::net::client::dgram;
+use domain::net::client::dgram_stream;
 use domain::net::client::multi_stream;
+use domain::net::client::protocol::TlsConnect;
+use domain::net::client::protocol::{TcpConnect, UdpConnect};
 use domain::net::client::redundant;
-use domain::net::client::request::Request;
-use domain::net::client::request_message::RequestMessage;
-use domain::net::client::tcp_connect::TcpConnect;
-use domain::net::client::tls_connect::TlsConnect;
-use domain::net::client::udp;
-use domain::net::client::udp_tcp;
+use domain::net::client::request::SendRequest;
+use domain::net::client::request::{ComposeRequest, RequestMessage};
 use domain::rdata::AllRecordData;
 use domain::serve::buf::BufSource;
 use domain::serve::dgram::DgramServer;
 use domain::serve::service::{
     CallResult, Service, ServiceError, Transaction,
 };
-use futures::Stream;
-use futures::{future::BoxFuture, FutureExt};
+use futures_util::stream::Stream;
+use futures_util::{future::BoxFuture, FutureExt};
 use rustls::ClientConfig;
 use serde::Deserialize;
 use serde::Serialize;
@@ -236,7 +235,7 @@ fn to_stream_target<Octs1: Octets>(
 fn query_service<
     RequestOctets: AsRef<[u8]> + Debug + Octets + Send + Sync + 'static,
 >(
-    conn: impl Request<RequestMessage<RequestOctets>>
+    conn: impl SendRequest<RequestMessage<RequestOctets>>
         + Clone
         + Send
         + Sync
@@ -248,7 +247,7 @@ where
     /// Basic query function for Service.
     fn query<RequestOctets: AsRef<[u8]> + Debug + Octets>(
         message: Message<RequestOctets>,
-        conn: impl Request<RequestMessage<RequestOctets>> + Send + Sync,
+        conn: impl SendRequest<RequestMessage<RequestOctets>> + Send + Sync,
     ) -> Transaction<
         impl Future<Output = Result<CallResult<Vec<u8>>, ServiceError<()>>>,
         impl Stream<Item = Result<CallResult<Vec<u8>>, ServiceError<()>>>,
@@ -264,7 +263,7 @@ where
             println!("request {:?}", message);
             let request_msg = RequestMessage::new(message);
             println!("request {:?}", request_msg);
-            let mut query = conn.request(&request_msg).await.unwrap();
+            let mut query = conn.send_request(request_msg);
             let reply = query.get_response().await.unwrap();
             println!("got reply {:?}", reply);
 
@@ -442,10 +441,9 @@ async fn get_redun<
     config: RedundantConfig,
 ) -> redundant::Connection<CR> {
     println!("Creating new redundant::Connection");
-    let redun = redundant::Connection::new(None).unwrap();
-    let redun_run = redun.clone();
+    let (redun, transport) = redundant::Connection::new();
     tokio::spawn(async move {
-        redun_run.run().await;
+        transport.run().await;
     });
     println!("Adding to redundant::Connection");
     for e in config.transports {
@@ -459,14 +457,13 @@ async fn get_redun<
 /// Get a TCP transport based on its config
 fn get_tcp<CR: ComposeRequest + Clone + 'static>(
     config: TcpConfig,
-) -> impl Request<CR> + Clone + Send + Sync {
+) -> impl SendRequest<CR> + Clone + Send + Sync {
     let sockaddr = get_sockaddr(&config.addr, config.port.as_deref(), 53);
     let tcp_connect = TcpConnect::new(sockaddr);
 
-    let conn = multi_stream::Connection::new(None).unwrap();
-    let run_fut = conn.run(tcp_connect);
+    let (conn, transport) = multi_stream::Connection::new(tcp_connect);
     tokio::spawn(async move {
-        run_fut.await.unwrap();
+        transport.run().await;
         println!("run terminated");
     });
 
@@ -476,7 +473,7 @@ fn get_tcp<CR: ComposeRequest + Clone + 'static>(
 /// Get a TLS transport based on its config
 fn get_tls<CR: ComposeRequest + Clone + 'static>(
     config: TlsConfig,
-) -> impl Request<CR> + Clone + Send + Sync {
+) -> impl SendRequest<CR> + Clone + Send + Sync {
     let sockaddr = get_sockaddr(&config.addr, config.port.as_deref(), 853);
 
     let mut root_store = rustls::RootCertStore::empty();
@@ -496,12 +493,14 @@ fn get_tls<CR: ComposeRequest + Clone + 'static>(
             .with_no_client_auth(),
     );
 
-    let tls_connect =
-        TlsConnect::new(client_config, &config.servername, sockaddr);
-    let conn = multi_stream::Connection::new(None).unwrap();
-    let run_fut = conn.run(tls_connect);
+    let tls_connect = TlsConnect::new(
+        client_config,
+        config.servername.as_str().try_into().unwrap(),
+        sockaddr,
+    );
+    let (conn, transport) = multi_stream::Connection::new(tls_connect);
     tokio::spawn(async move {
-        run_fut.await.unwrap();
+        transport.run().await;
         println!("run terminated");
     });
 
@@ -511,22 +510,24 @@ fn get_tls<CR: ComposeRequest + Clone + 'static>(
 /// Get a UDP-only transport based on its config
 fn get_udp<CR: ComposeRequest + Clone + 'static>(
     config: UdpConfig,
-) -> impl Request<CR> + Clone + Send + Sync {
+) -> impl SendRequest<CR> + Clone + Send + Sync {
     let sockaddr = get_sockaddr(&config.addr, config.port.as_deref(), 53);
 
-    udp::Connection::new(None, sockaddr).unwrap()
+    let udp_connect = UdpConnect::new(sockaddr);
+    dgram::Connection::new(udp_connect)
 }
 
 /// Get a UDP+TCP transport based on its config
 fn get_udptcp<CR: ComposeRequest + Clone + 'static>(
     config: UdpTcpConfig,
-) -> impl Request<CR> + Clone + Send + Sync {
+) -> impl SendRequest<CR> + Clone + Send + Sync {
     let sockaddr = get_sockaddr(&config.addr, config.port.as_deref(), 53);
-    let conn = udp_tcp::Connection::new(None, sockaddr).unwrap();
-    let conn_run = conn.clone();
-
+    let udp_connect = UdpConnect::new(sockaddr);
+    let tcp_connect = TcpConnect::new(sockaddr);
+    let (conn, transport) =
+        dgram_stream::Connection::new(udp_connect, tcp_connect);
     tokio::spawn(async move {
-        conn_run.run().await.unwrap();
+        transport.run().await;
         println!("run terminated");
     });
     conn
@@ -535,13 +536,13 @@ fn get_udptcp<CR: ComposeRequest + Clone + 'static>(
 /// Get a transport based on its config
 fn get_transport<CR: ComposeRequest + Clone + 'static>(
     config: TransportConfig,
-) -> BoxFuture<'static, Box<dyn Request<CR> + Send + Sync>> {
+) -> BoxFuture<'static, Box<dyn SendRequest<CR> + Send + Sync>> {
     // We have an indirectly recursive async function. This function calls
     // get_redun which calls this function. The solution is to return a
     // boxed future.
     async move {
         println!("got config {:?}", config);
-        let a: Box<dyn Request<CR> + Send + Sync> = match config {
+        let a: Box<dyn SendRequest<CR> + Send + Sync> = match config {
             TransportConfig::Redundant(redun_conf) => {
                 Box::new(get_redun(redun_conf).await)
             }
@@ -559,7 +560,7 @@ fn get_transport<CR: ComposeRequest + Clone + 'static>(
 
 /// Start a service based on a transport, a UDP server socket and a buffer
 fn start_service(
-    conn: impl Request<RequestMessage<VecU8>> + Clone + Send + Sync + 'static,
+    conn: impl SendRequest<RequestMessage<VecU8>> + Clone + Send + Sync + 'static,
     socket: UdpSocket,
     buf_source: Arc<VecBufSource>,
 ) -> JoinHandle<Result<(), std::io::Error>> {

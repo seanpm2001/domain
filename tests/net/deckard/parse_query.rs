@@ -9,35 +9,32 @@
 //! This may or may not be a good strategy. It was primarily implemented to
 //! see that the [`Scan`] trait is powerful enough to build such an
 //! implementation.
-#![cfg(feature = "bytes")]
-#![cfg_attr(docsrs, doc(cfg(feature = "bytes")))]
+// #![cfg(feature = "bytes")]
+// #![cfg_attr(docsrs, doc(cfg(feature = "bytes")))]
 
-use crate::base::charstr::CharStr;
-use crate::base::iana::{Class, Rtype};
-use crate::base::name::{Chain, Dname, RelativeDname, ToDname};
-use crate::base::record::Record;
-use crate::base::scan::{
-    BadSymbol, ConvertSymbols, EntrySymbol, Scan, Scanner, ScannerError,
-    Symbol, SymbolOctetsError,
-};
-use crate::base::Ttl;
-use crate::rdata::ZoneRecordData;
 use bytes::buf::UninitSlice;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use core::str::FromStr;
 use core::{fmt, str};
-use octseq::str::Str;
+use domain::base::charstr::CharStr;
+use domain::base::iana::{Class, Rtype};
+use domain::base::name::{Chain, Dname, RelativeDname, ToDname};
+use domain::base::scan::{
+    BadSymbol, ConvertSymbols, EntrySymbol, Scan, Scanner, ScannerError,
+    Symbol, SymbolOctetsError,
+};
+use domain::base::Question;
+use domain::base::Ttl;
+use domain::dep::octseq::str::Str;
 
 //------------ Type Aliases --------------------------------------------------
 
 /// The type used for scanned domain names.
 pub type ScannedDname = Chain<RelativeDname<Bytes>, Dname<Bytes>>;
 
-/// The type used for scanned record data.
-pub type ScannedRecordData = ZoneRecordData<Bytes, ScannedDname>;
-
 /// The type used for scanned records.
-pub type ScannedRecord = Record<ScannedDname, ScannedRecordData>;
+
+pub type ScannedQueryRecord = Question<ScannedDname>;
 
 /// The type used for scanned strings.
 pub type ScannedString = Str<Bytes>;
@@ -91,22 +88,11 @@ impl Zonefile {
     fn with_buf(buf: SourceBuf) -> Self {
         Zonefile {
             buf,
-            origin: None,
+            origin: Some(Dname::root_bytes()),
             last_owner: None,
-            last_ttl: None,
+            last_ttl: Some(Ttl::ZERO),
             last_class: None,
         }
-    }
-
-    /// Creates a value by loading the data from the given reader.
-    #[cfg(feature = "std")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
-    pub fn load(
-        read: &mut impl std::io::Read,
-    ) -> Result<Self, std::io::Error> {
-        let mut buf = Self::new().writer();
-        std::io::copy(read, &mut buf)?;
-        Ok(buf.into_inner())
     }
 }
 
@@ -131,11 +117,6 @@ impl<'a> From<&'a [u8]> for Zonefile {
 }
 
 impl Zonefile {
-    /// Reserves at least `len` additional bytes in the buffer.
-    pub fn reserve(&mut self, len: usize) {
-        self.buf.buf.reserve(len);
-    }
-
     /// Appends the given slice to the end of the buffer.
     pub fn extend_from_slice(&mut self, slice: &[u8]) {
         self.buf.buf.extend_from_slice(slice)
@@ -157,15 +138,6 @@ unsafe impl BufMut for Zonefile {
 }
 
 impl Zonefile {
-    /// Sets the origin of the zonefile.
-    ///
-    /// The origin is append to relative domain names encountered in the
-    /// data. Ininitally, there is no origin set. If relative names are
-    /// encountered, an error happenes.
-    pub fn set_origin(&mut self, origin: Dname<Bytes>) {
-        self.origin = Some(origin)
-    }
-
     /// Returns the next entry in the zonefile.
     ///
     /// Returns `Ok(None)` if the end of the file has been reached. Returns
@@ -209,7 +181,7 @@ impl Iterator for Zonefile {
 #[derive(Clone, Debug)]
 pub enum Entry {
     /// A DNS record.
-    Record(ScannedRecord),
+    QueryRecord(ScannedQueryRecord),
 
     /// An include directive.
     ///
@@ -332,7 +304,7 @@ impl<'a> EntryScanner<'a> {
         owner: ScannedDname,
         new_owner: bool,
     ) -> Result<ScannedEntry, EntryError> {
-        let (class, ttl, rtype) = self.scan_ctr()?;
+        let (class, qtype) = self.scan_qcr()?;
 
         if new_owner {
             self.zonefile.last_owner = Some(owner.clone());
@@ -349,30 +321,15 @@ impl<'a> EntryScanner<'a> {
             },
         };
 
-        let ttl = match ttl {
-            Some(ttl) => {
-                self.zonefile.last_ttl = Some(ttl);
-                ttl
-            }
-            None => match self.zonefile.last_ttl {
-                Some(ttl) => ttl,
-                None => return Err(EntryError::missing_last_ttl()),
-            },
-        };
-
-        let data = ZoneRecordData::scan(rtype, self)?;
-
         self.zonefile.buf.require_line_feed()?;
 
-        Ok(ScannedEntry::Entry(Entry::Record(Record::new(
-            owner, class, ttl, data,
+        Ok(ScannedEntry::Entry(Entry::QueryRecord(Question::new(
+            owner, qtype, class,
         ))))
     }
 
-    /// Scans the TTL, class, and type portions of a regular record.
-    fn scan_ctr(
-        &mut self,
-    ) -> Result<(Option<Class>, Option<Ttl>, Rtype), EntryError> {
+    /// Scans the class, and type portions of a query record.
+    fn scan_qcr(&mut self) -> Result<(Option<Class>, Rtype), EntryError> {
         // Possible options are:
         //
         //   [<TTL>] [<class>] <type>
@@ -380,76 +337,33 @@ impl<'a> EntryScanner<'a> {
 
         enum Ctr {
             Class(Class),
-            Ttl(Ttl),
-            Rtype(Rtype),
+            Qtype(Rtype),
         }
 
         let first = self.scan_ascii_str(|s| {
-            if let Ok(ttl) = u32::from_str(s) {
-                Ok(Ctr::Ttl(Ttl::from_secs(ttl)))
-            } else if let Ok(rtype) = Rtype::from_str(s) {
-                Ok(Ctr::Rtype(rtype))
+            if let Ok(qtype) = Rtype::from_str(s) {
+                Ok(Ctr::Qtype(qtype))
             } else if let Ok(class) = Class::from_str(s) {
                 Ok(Ctr::Class(class))
             } else {
-                Err(EntryError::expected_rtype())
+                Err(EntryError::expected_qtype())
             }
         })?;
 
         match first {
-            Ctr::Ttl(ttl) => {
-                // We have a TTL. Now there may be a class or an rtype. We can
-                // abuse Result<Rtype, Class> for that.
-                let second = self.scan_ascii_str(|s| {
-                    if let Ok(rtype) = Rtype::from_str(s) {
-                        Ok(Ok(rtype))
-                    } else if let Ok(class) = Class::from_str(s) {
-                        Ok(Err(class))
-                    } else {
-                        Err(EntryError::expected_rtype())
-                    }
-                })?;
-
-                match second {
-                    Err(class) => {
-                        // Rtype is next.
-                        let rtype = self.scan_ascii_str(|s| {
-                            Rtype::from_str(s)
-                                .map_err(|_| EntryError::expected_rtype())
-                        })?;
-
-                        Ok((Some(class), Some(ttl), rtype))
-                    }
-                    Ok(rtype) => Ok((None, Some(ttl), rtype)),
-                }
-            }
             Ctr::Class(class) => {
-                // We have a class. Now there may be a TTL or an rtype. We can
-                // abuse Result<Rtype, TTL> for that.
-                let second = self.scan_ascii_str(|s| {
-                    if let Ok(ttl) = u32::from_str(s) {
-                        Ok(Err(Ttl::from_secs(ttl)))
-                    } else if let Ok(rtype) = Rtype::from_str(s) {
-                        Ok(Ok(rtype))
+                // We have a class. Now there may be a qtype.
+                let qtype = self.scan_ascii_str(|s| {
+                    if let Ok(qtype) = Rtype::from_str(s) {
+                        Ok(qtype)
                     } else {
-                        Err(EntryError::expected_rtype())
+                        Err(EntryError::expected_qtype())
                     }
                 })?;
 
-                match second {
-                    Err(ttl) => {
-                        // Rtype is next.
-                        let rtype = self.scan_ascii_str(|s| {
-                            Rtype::from_str(s)
-                                .map_err(|_| EntryError::expected_rtype())
-                        })?;
-
-                        Ok((Some(class), Some(ttl), rtype))
-                    }
-                    Ok(rtype) => Ok((Some(class), None, rtype)),
-                }
+                Ok((Some(class), qtype))
             }
-            Ctr::Rtype(rtype) => Ok((None, None, rtype)),
+            Ctr::Qtype(qtype) => Ok((None, qtype)),
         }
     }
 
@@ -654,20 +568,7 @@ impl<'a> Scanner for EntryScanner<'a> {
                     }
                 }
                 Some(true) => {
-                    // Last symbol was a dot. If it is was the very first
-                    // symbol, this can only be the root name. Check for that
-                    // and, if so, return. Otherwise, check length and
-                    // continue to the next label.
-                    if write == 1 {
-                        if self.zonefile.buf.next_symbol()?.is_some() {
-                            return Err(EntryError::bad_dname());
-                        } else {
-                            self.zonefile.buf.next_item()?;
-                            return Ok(RelativeDname::empty()
-                                .chain(Dname::root())
-                                .expect("failed to make root name"));
-                        }
-                    }
+                    // Last symbol was a dot: check length and continue.
                     if write > 254 {
                         return Err(EntryError::bad_dname());
                     }
@@ -874,9 +775,6 @@ impl<'a> EntryScanner<'a> {
                             (*write - start - 1) as u8;
                         return Ok(Some(false));
                     } else {
-                        // There’s been nothing. Reset the write position
-                        // and return.
-                        *write = start;
                         return Ok(None);
                     }
                 }
@@ -1452,16 +1350,12 @@ impl EntryError {
         EntryError("missing last class")
     }
 
-    fn missing_last_ttl() -> Self {
-        EntryError("missing last ttl")
-    }
-
     fn missing_origin() -> Self {
         EntryError("missing origin")
     }
 
-    fn expected_rtype() -> Self {
-        EntryError("expected rtype")
+    fn expected_qtype() -> Self {
+        EntryError("expected qtype")
     }
 
     fn unknown_control() -> Self {
@@ -1505,7 +1399,7 @@ impl fmt::Display for EntryError {
     }
 }
 
-#[cfg(feature = "std")]
+//#[cfg(feature = "std")]
 impl std::error::Error for EntryError {}
 
 //------------ Error ---------------------------------------------------------
@@ -1523,17 +1417,16 @@ impl fmt::Display for Error {
     }
 }
 
-#[cfg(feature = "std")]
+//#[cfg(feature = "std")]
 impl std::error::Error for Error {}
 
 //============ Tests =========================================================
 
+/*
 #[cfg(test)]
 #[cfg(feature = "std")]
 mod test {
     use super::*;
-    use crate::base::ParsedDname;
-    use octseq::Parser;
     use std::vec::Vec;
 
     fn with_entry(s: &str, op: impl FnOnce(EntryScanner)) {
@@ -1575,8 +1468,7 @@ mod test {
     struct TestCase {
         origin: Dname<Bytes>,
         zonefile: std::string::String,
-        result:
-            Vec<Record<Dname<Bytes>, ZoneRecordData<Bytes, Dname<Bytes>>>>,
+        result: Vec<Record<Dname<Bytes>, ZoneRecordData<Bytes, Dname<Bytes>>>>,
     }
 
     impl TestCase {
@@ -1592,29 +1484,6 @@ mod test {
                         let (first, tail) = result.split_first().unwrap();
                         assert_eq!(first, &record);
                         result = tail;
-
-                        let mut buf = BytesMut::new();
-                        record.compose(&mut buf).unwrap();
-                        let buf = buf.freeze();
-                        let mut parser = Parser::from_ref(&buf);
-                        let parsed =
-                            Record::<
-                                ParsedDname<Bytes>,
-                                ZoneRecordData<Bytes, ParsedDname<Bytes>>,
-                            >::parse(&mut parser)
-                            .unwrap()
-                            .unwrap();
-
-                        // The unknown test case has known type/class
-                        // to current implementation. The parsed
-                        // record will not be unknown again. So here
-                        // we don't compare it with the original.
-                        if !matches!(
-                            record.data(),
-                            ZoneRecordData::Unknown(_)
-                        ) {
-                            assert_eq!(first, &parsed);
-                        }
                     }
                     _ => panic!(),
                 }
@@ -1623,19 +1492,10 @@ mod test {
     }
 
     #[test]
-    fn test_basic_yaml() {
+    fn test_data() {
         TestCase::test(include_str!("../../test-data/zonefiles/basic.yaml"));
-    }
-
-    #[test]
-    fn test_escape_yaml() {
         TestCase::test(include_str!("../../test-data/zonefiles/escape.yaml"));
-    }
-
-    #[test]
-    fn test_unknown_yaml() {
-        TestCase::test(include_str!(
-            "../../test-data/zonefiles/unknown.yaml"
-        ));
+        TestCase::test(include_str!("../../test-data/zonefiles/unknown.yaml"));
     }
 }
+*/

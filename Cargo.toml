@@ -1,6 +1,6 @@
 [package]
 name = "domain"
-version = "0.9.1-dev"
+version = "0.9.3-dev"
 rust-version = "1.67.0"
 edition = "2021"
 authors = ["NLnet Labs <dns-team@nlnetlabs.nl>"]
@@ -17,13 +17,14 @@ name = "domain"
 path = "src/lib.rs"
 
 [dependencies]
-octseq         = "0.3"
-time           = "0.3.1"
+octseq           = "0.3"
+pin-project-lite = "0.2"
+time             = "0.3.1"
 
 rand           = { version = "0.8", optional = true }
 bytes          = { version = "1.0", optional = true }
 chrono         = { version = "0.4.6", optional = true, default-features = false }
-futures        = { version = "0.3", optional = true }
+futures-util   = { version = "0.3", optional = true }
 heapless       = { version = "0.7", optional = true }
 libc           = { version = "0.2.79", default-features = false, optional = true } # 0.2.79 is the first version that has IP_PMTUDISC_OMIT
 #openssl       = { version = "0.10", optional = true }
@@ -48,7 +49,7 @@ default     = ["std", "rand"]
 bytes       = ["dep:bytes", "octseq/bytes"]
 heapless    = ["dep:heapless", "octseq/heapless"]
 interop     = ["bytes", "ring"]
-resolv      = ["bytes", "futures", "smallvec", "std", "tokio", "libc", "rand"]
+resolv      = ["net", "smallvec", "std", "rand", "unstable-client-transport"]
 resolv-sync = ["resolv", "tokio/rt"]
 serde       = ["dep:serde", "octseq/serde"]
 serve       = ["bytes", "chrono/clock", "futures", "libc", "std", "tokio"]
@@ -56,14 +57,17 @@ serve-sync  = []
 sign        = ["std"]
 smallvec    = ["dep:smallvec", "octseq/smallvec"]
 std         = []
-net         = ["bytes", "futures", "std", "tokio", "tokio-rustls"]
+net         = ["bytes", "futures-util", "std", "tokio", "tokio-rustls"]
 tsig        = ["bytes", "ring", "smallvec"]
 validate    = ["std", "ring"]
 zonefile    = ["bytes", "std"]
 
+# Unstable features
+unstable-client-transport = []
+
 # This feature should include all features that the CI should include for a
 # test run. Which is everything except interop.
-ci-test     = ["resolv", "resolv-sync", "sign", "std", "serde", "tsig", "validate", "zonefile"]
+ci-test     = ["net", "resolv", "resolv-sync", "sign", "std", "serde", "tsig", "validate", "zonefile"]
 
 [dev-dependencies]
 clap       = { version = "=4.3.12", features = ["derive"] }
@@ -81,6 +85,7 @@ serde_yaml         = "0.9"
 tokio            = { version = "1", features = ["rt-multi-thread", "io-util", "net", "test-util"] }
 tokio-native-tls = "0.3"
 tokio-rustls       = { version = "0.24.1" }
+tokio-test	   = "0.4"
 webpki-roots       = { version = "0.25.2" }
 
 [package.metadata.docs.rs]

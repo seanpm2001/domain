@@ -1,18 +1,16 @@
+/// Using the `domain::net::client` module for sending a query.
 use domain::base::Dname;
 use domain::base::MessageBuilder;
 use domain::base::Rtype::Aaaa;
+use domain::net::client::dgram;
+use domain::net::client::dgram_stream;
 use domain::net::client::multi_stream;
-use domain::net::client::octet_stream;
+use domain::net::client::protocol::{TcpConnect, TlsConnect, UdpConnect};
 use domain::net::client::redundant;
-use domain::net::client::request::Request;
-use domain::net::client::request_message::RequestMessage;
-use domain::net::client::tcp_connect::TcpConnect;
-use domain::net::client::tls_connect::TlsConnect;
-use domain::net::client::udp;
-use domain::net::client::udp_tcp;
+use domain::net::client::request::{RequestMessage, SendRequest};
+use domain::net::client::stream;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -20,60 +18,59 @@ use tokio_rustls::rustls::{ClientConfig, OwnedTrustAnchor, RootCertStore};
 
 #[tokio::main]
 async fn main() {
-    // Create DNS request message. It would be nice if there was an object
-    // that implements both MessageBuilder and BaseMEssageBuilder. Until
-    // that time, first create a message using MessageBuilder, then turn
-    // that into a Message, and create a BaseMessaBuilder based on the message.
+    // Create DNS request message.
+    //
+    // Transports currently take a `RequestMessage` as their input to be able
+    // to add options along the way.
+    //
+    // In the future, it will also be possible to pass in a message or message
+    // builder directly as input but for now it needs to be converted into a
+    // `RequestMessage` manually.
     let mut msg = MessageBuilder::new_vec();
     msg.header_mut().set_rd(true);
     let mut msg = msg.question();
-    msg.push((Dname::<Vec<u8>>::vec_from_str("example.com").unwrap(), Aaaa))
+    msg.push((Dname::vec_from_str("example.com").unwrap(), Aaaa))
         .unwrap();
-
-    // Create a Message to pass to BMB.
-    let msg = msg.into_message();
-
-    // Transports take a BaseMEssageBuilder to be able to add options along
-    // the way and only flatten just before actually writing to the network.
     let req = RequestMessage::new(msg);
 
     // Destination for UDP and TCP
     let server_addr = SocketAddr::new(IpAddr::from_str("::1").unwrap(), 53);
 
-    let octet_stream_config = octet_stream::Config {
-        response_timeout: Duration::from_millis(100),
-    };
-    let multi_stream_config = multi_stream::Config {
-        octet_stream: Some(octet_stream_config.clone()),
-    };
+    let mut stream_config = stream::Config::new();
+    stream_config.set_response_timeout(Duration::from_millis(100));
+    let multi_stream_config =
+        multi_stream::Config::from(stream_config.clone());
 
     // Create a new UDP+TCP transport connection. Pass the destination address
     // and port as parameter.
-    let udp_config = udp::Config {
-        max_parallel: 1,
-        read_timeout: Duration::from_millis(1000),
-        max_retries: 1,
-        udp_payload_size: Some(1400),
-    };
-    let udp_tcp_config = udp_tcp::Config {
-        udp: Some(udp_config.clone()),
-        multi_stream: Some(multi_stream_config.clone()),
-    };
-    let udptcp_conn =
-        udp_tcp::Connection::new(Some(udp_tcp_config), server_addr).unwrap();
+    let mut dgram_config = dgram::Config::new();
+    dgram_config.set_max_parallel(1);
+    dgram_config.set_read_timeout(Duration::from_millis(1000));
+    dgram_config.set_max_retries(1);
+    dgram_config.set_udp_payload_size(Some(1400));
+    let dgram_stream_config = dgram_stream::Config::from_parts(
+        dgram_config.clone(),
+        multi_stream_config.clone(),
+    );
+    let udp_connect = UdpConnect::new(server_addr);
+    let tcp_connect = TcpConnect::new(server_addr);
+    let (udptcp_conn, transport) = dgram_stream::Connection::with_config(
+        udp_connect,
+        tcp_connect,
+        dgram_stream_config,
+    );
 
     // Start the run function in a separate task. The run function will
     // terminate when all references to the connection have been dropped.
     // Make sure that the task does not accidentally get a reference to the
     // connection.
-    let run_fut = udptcp_conn.run();
     tokio::spawn(async move {
-        let res = run_fut.await;
-        println!("UDP+TCP run exited with {:?}", res);
+        transport.run().await;
+        println!("UDP+TCP run exited");
     });
 
     // Send a query message.
-    let mut request = udptcp_conn.request(&req).await.unwrap();
+    let mut request = udptcp_conn.send_request(&req).await.unwrap();
 
     // Get the reply
     println!("Wating for UDP+TCP reply");
@@ -90,20 +87,20 @@ async fn main() {
 
     // A muli_stream transport connection sets up new TCP connections when
     // needed.
-    let tcp_conn =
-        multi_stream::Connection::new(Some(multi_stream_config.clone()))
-            .unwrap();
+    let (tcp_conn, transport) = multi_stream::Connection::with_config(
+        tcp_connect,
+        multi_stream_config.clone(),
+    );
 
     // Get a future for the run function. The run function receives
     // the connection stream as a parameter.
-    let run_fut = tcp_conn.run(tcp_connect);
     tokio::spawn(async move {
-        let res = run_fut.await;
-        println!("multi TCP run exited with {:?}", res);
+        transport.run().await;
+        println!("multi TCP run exited");
     });
 
     // Send a query message.
-    let mut request = tcp_conn.request(&req).await.unwrap();
+    let mut request = tcp_conn.send_request(&req).await.unwrap();
 
     // Get the reply. A multi_stream connection does not have any timeout.
     // Wrap get_result in a timeout.
@@ -127,12 +124,10 @@ async fn main() {
     ));
 
     // TLS config
-    let client_config = Arc::new(
-        ClientConfig::builder()
-            .with_safe_defaults()
-            .with_root_certificates(root_store)
-            .with_no_client_auth(),
-    );
+    let client_config = ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
 
     // Currently the only support TLS connections are the ones that have a
     // valid certificate. Use a well known public resolver.
@@ -141,21 +136,25 @@ async fn main() {
 
     // Create a new TLS connections object. We pass the TLS config, the name of
     // the remote server and the destination address and port.
-    let tls_connect =
-        TlsConnect::new(client_config, "dns.google", google_server_addr);
+    let tls_connect = TlsConnect::new(
+        client_config,
+        "dns.google".try_into().unwrap(),
+        google_server_addr,
+    );
 
     // Again create a multi_stream transport connection.
-    let tls_conn =
-        multi_stream::Connection::new(Some(multi_stream_config)).unwrap();
+    let (tls_conn, transport) = multi_stream::Connection::with_config(
+        tls_connect,
+        multi_stream_config,
+    );
 
     // Start the run function.
-    let run_fut = tls_conn.run(tls_connect);
     tokio::spawn(async move {
-        let res = run_fut.await;
-        println!("TLS run exited with {:?}", res);
+        transport.run().await;
+        println!("TLS run exited");
     });
 
-    let mut request = tls_conn.request(&req).await.unwrap();
+    let mut request = tls_conn.send_request(&req).await.unwrap();
     println!("Wating for TLS reply");
     let reply =
         timeout(Duration::from_millis(500), request.get_response()).await;
@@ -180,7 +179,7 @@ async fn main() {
 
     // Start a few queries.
     for i in 1..10 {
-        let mut request = redun.request(&req).await.unwrap();
+        let mut request = redun.send_request(&req).await.unwrap();
         let reply = request.get_response().await;
         if i == 2 {
             println!("redundant connection reply: {:?}", reply);
@@ -189,19 +188,17 @@ async fn main() {
 
     drop(redun);
 
-    // Create a new UDP transport connection. Pass the destination address
+    // Create a new datagram transport connection. Pass the destination address
     // and port as parameter. This transport does not retry over TCP if the
     // reply is truncated. This transport does not have a separate run
     // function.
-    let udp_conn =
-        udp::Connection::new(Some(udp_config), server_addr).unwrap();
+    let udp_connect = UdpConnect::new(server_addr);
+    let dgram_conn =
+        dgram::Connection::with_config(udp_connect, dgram_config);
 
-    // Send a query message.
-    let mut request = udp_conn.request(&req).await.unwrap();
-
-    // Get the reply
-    let reply = request.get_response().await;
-    println!("UDP reply: {:?}", reply);
+    // Send a query message and get the reply.
+    let reply = dgram_conn.query(req.clone()).await.unwrap();
+    println!("Dgram reply: {:?}", reply);
 
     // Create a single TCP transport connection. This is usefull for a
     // single request or a small burst of requests.
@@ -216,15 +213,14 @@ async fn main() {
         }
     };
 
-    let tcp = octet_stream::Connection::new(None).unwrap();
-    let run_fut = tcp.run(tcp_conn);
+    let (tcp, transport) = stream::Connection::new(tcp_conn);
     tokio::spawn(async move {
-        run_fut.await;
+        transport.run().await;
         println!("single TCP run terminated");
     });
 
     // Send a request message.
-    let mut request = tcp.request(&req).await.unwrap();
+    let mut request = tcp.send_request(&req).await.unwrap();
 
     // Get the reply
     let reply = request.get_response().await;

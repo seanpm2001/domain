@@ -6,126 +6,162 @@
 // To do:
 // - too many connection errors
 
+use crate::base::Message;
+use crate::net::client::protocol::AsyncConnect;
+use crate::net::client::request::{
+    ComposeRequest, Error, GetResponse, HandleRequest, SendRequest,
+};
+use crate::net::client::stream;
 use bytes::Bytes;
-
-use futures::stream::FuturesUnordered;
-use futures::StreamExt;
-
-use octseq::Octets;
-
+use futures_util::stream::FuturesUnordered;
+use futures_util::{FutureExt, StreamExt};
 use rand::random;
-
 use std::boxed::Box;
 use std::fmt::Debug;
 use std::future::Future;
-use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
-
 use tokio::io;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep_until, Instant};
 
-use crate::base::iana::Rcode;
-use crate::base::Message;
-use crate::net::client::async_connect::AsyncConnect;
-use crate::net::client::compose_request::ComposeRequest;
-use crate::net::client::error::Error;
-use crate::net::client::octet_stream;
-use crate::net::client::request::{GetResponse, Request};
+//------------ Constants -----------------------------------------------------
 
-/// Capacity of the channel that transports [ChanReq].
+/// Capacity of the channel that transports `ChanReq`.
 const DEF_CHAN_CAP: usize = 8;
 
-/// Error reported when the connection is closed and
-/// [InnerConnection::run] terminated.
+/// Error messafe when the connection is closed.
 const ERR_CONN_CLOSED: &str = "connection closed";
 
 //------------ Config ---------------------------------------------------------
 
-/// Configuration for an octet_stream transport connection.
+/// Configuration for an multi-stream transport.
 #[derive(Clone, Debug, Default)]
 pub struct Config {
-    /// Response timeout.
-    pub octet_stream: Option<octet_stream::Config>,
+    /// Configuration of the underlying stream transport.
+    stream: stream::Config,
+}
+
+impl Config {
+    /// Returns the underlying stream config.
+    pub fn stream(&self) -> &stream::Config {
+        &self.stream
+    }
+
+    /// Returns a mutable reference to the underlying stream config.
+    pub fn stream_mut(&mut self) -> &mut stream::Config {
+        &mut self.stream
+    }
+}
+
+impl From<stream::Config> for Config {
+    fn from(stream: stream::Config) -> Self {
+        Self { stream }
+    }
 }
 
 //------------ Connection -----------------------------------------------------
 
-#[derive(Clone, Debug)]
-/// A DNS over octect streams transport.
-pub struct Connection<CR> {
-    /// Reference counted [InnerConnection].
-    inner: Arc<InnerConnection<CR>>,
+/// A connection to a multi-stream transport.
+#[derive(Debug)]
+pub struct Connection<Req> {
+    /// The sender half of the connection request channel.
+    sender: mpsc::Sender<ChanReq<Req>>,
 }
 
-impl<CR: ComposeRequest + Clone + 'static> Connection<CR> {
-    /// Constructor for [Connection].
-    ///
-    /// Returns a [Connection] wrapped in a [Result](io::Result).
-    pub fn new(config: Option<Config>) -> Result<Self, Error> {
-        let config = match config {
-            Some(config) => {
-                check_config(&config)?;
-                config
-            }
-            None => Default::default(),
-        };
-        let connection = InnerConnection::new(config)?;
-        Ok(Self {
-            inner: Arc::new(connection),
-        })
+impl<Req> Connection<Req> {
+    /// Creates a new multi-stream transport with default configuration.
+    pub fn new<Remote>(remote: Remote) -> (Self, Transport<Remote, Req>) {
+        Self::with_config(remote, Default::default())
     }
 
-    /// Main execution function for [Connection].
-    ///
-    /// This function has to run in the background or together with
-    /// any calls to [query](Self::query) or [ReqResp::get_response].
-    pub fn run<
-        S: AsyncConnect<Connection = C> + Send + 'static,
-        C: 'static + AsyncRead + AsyncWrite + Debug + Send + Sync + Unpin,
-    >(
+    /// Creates a new multi-stream transport.
+    pub fn with_config<Remote>(
+        remote: Remote,
+        config: Config,
+    ) -> (Self, Transport<Remote, Req>) {
+        let (sender, transport) = Transport::new(remote, config);
+        (Self { sender }, transport)
+    }
+}
+
+impl<Req: ComposeRequest + Clone> Connection<Req> {
+    /// Sends a request and receives a response.
+    pub async fn request(
         &self,
-        stream: S,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send>> {
-        self.inner.run(stream)
+        request: Req,
+    ) -> Result<Message<Bytes>, Error> {
+        Query::new(self.clone(), request).get_response().await
     }
 
-    /// Start a DNS request.
+    /// Starts a request.
     ///
-    /// This function takes a precomposed message as a parameter and
-    /// returns a [ReqResp] object wrapped in a [Result].
-    async fn query_impl(
+    /// This is the future that is returned by the `SendRequest` impl.
+    async fn _send_request(
         &self,
-        query_msg: &CR,
-    ) -> Result<Box<dyn GetResponse + Send>, Error> {
-        let (tx, rx) = oneshot::channel();
-        self.inner.new_conn(None, tx).await?;
-        let gr = ReqResp::<CR>::new(self.clone(), query_msg, rx);
+        request: &Req,
+    ) -> Result<Box<dyn GetResponse + Send>, Error>
+    where
+        Req: 'static,
+    {
+        let gr = Query::new(self.clone(), request.clone());
         Ok(Box::new(gr))
-    }
-
-    /// Shutdown this transport.
-    pub async fn shutdown(&self) -> Result<(), &'static str> {
-        self.inner.shutdown().await
     }
 
     /// Request a new connection.
     async fn new_conn(
         &self,
-        id: u64,
-        tx: oneshot::Sender<ChanResp<CR>>,
-    ) -> Result<(), Error> {
-        self.inner.new_conn(Some(id), tx).await
+        opt_id: Option<u64>,
+    ) -> Result<oneshot::Receiver<ChanResp<Req>>, Error> {
+        let (sender, receiver) = oneshot::channel();
+        let req = ChanReq {
+            cmd: ReqCmd::NewConn(opt_id, sender),
+        };
+        self.sender
+            .send(req)
+            .await
+            .map_err(|_| Error::ConnectionClosed)?;
+        Ok(receiver)
+    }
+
+    /// Request a shutdown.
+    pub async fn shutdown(&self) -> Result<(), &'static str> {
+        let req = ChanReq {
+            cmd: ReqCmd::Shutdown,
+        };
+        match self.sender.send(req).await {
+            Err(_) =>
+            // Send error. The receiver is gone, this means that the
+            // connection is closed.
+            {
+                Err(ERR_CONN_CLOSED)
+            }
+            Ok(_) => Ok(()),
+        }
     }
 }
 
-impl<CR: ComposeRequest + Clone + 'static> Request<CR> for Connection<CR> {
-    fn request<'a>(
+//--- Clone
+
+impl<Req> Clone for Connection<Req> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+        }
+    }
+}
+
+//--- SendRequest and HandleRequest
+
+impl<Req> SendRequest<Req> for Connection<Req>
+where
+    Req: ComposeRequest + Clone + 'static,
+{
+    fn send_request<'a>(
         &'a self,
-        request_msg: &'a CR,
+        request: &'a Req,
     ) -> Pin<
         Box<
             dyn Future<Output = Result<Box<dyn GetResponse + Send>, Error>>
@@ -133,107 +169,126 @@ impl<CR: ComposeRequest + Clone + 'static> Request<CR> for Connection<CR> {
                 + '_,
         >,
     > {
-        return Box::pin(self.query_impl(request_msg));
+        return Box::pin(self._send_request(request));
     }
 }
 
-//------------ ReqResp --------------------------------------------------------
+impl<Req> HandleRequest<Req> for Connection<Req>
+where
+    Req: ComposeRequest + Clone + Send,
+{
+    type Response = Message<Bytes>;
+    type Error = Error;
+    type Fut<'s> = Pin<Box<
+        dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 's
+    >> where Self: 's;
 
-/// This struct represent an active DNS request.
+    fn handle_request(&self, request: Req) -> Self::Fut<'_> {
+        self.request(request).boxed()
+    }
+}
+
+//------------ Query --------------------------------------------------------
+
+/// The connection side of an active request.
 #[derive(Debug)]
-pub struct ReqResp<CR: ComposeRequest> {
-    /// Request message.
+struct Query<Req> {
+    /// The request message.
     ///
-    /// The reply message is compared with the request message to see if
-    /// it matches the query.
-    // query_msg: Message<Vec<u8>>,
-    request_msg: CR,
+    /// It is kept so we can compare a response with it.
+    request_msg: Req,
 
     /// Current state of the query.
-    state: QueryState<CR>,
+    state: QueryState<Req>,
 
-    /// A multi_octet connection object is needed to request new underlying
-    /// octet_stream transport connections.
-    conn: Connection<CR>,
+    /// The underlying transport.
+    conn: Connection<Req>,
 
-    /// id of most recent connection.
-    conn_id: u64,
+    /// The id of the most recent connection, if any.
+    conn_id: Option<u64>,
 
-    // /// Number of retries without delay.
-    // imm_retry_count: u16,
     /// Number of retries with delay.
     delayed_retry_count: u64,
 }
 
-/// Status of a query. Used in [Query].
+/// The states of the query state machine.
 #[derive(Debug)]
-enum QueryState<CR> {
-    /// Get a octet_stream transport.
-    GetConn(oneshot::Receiver<ChanResp<CR>>),
+enum QueryState<Req> {
+    /// Request a new connection.
+    RequestConn,
 
-    /// Start a query using the transport.
-    StartQuery(octet_stream::Connection<CR>),
+    /// Receive a new connection from the receiver.
+    ReceiveConn(oneshot::Receiver<ChanResp<Req>>),
+
+    /// Start a query using the given stream transport.
+    StartQuery(Arc<stream::Connection<Req>>),
 
     /// Get the result of the query.
-    GetResult(octet_stream::QueryNoCheck),
+    GetResult(stream::Query),
 
     /// Wait until trying again.
     ///
-    /// The instant represents when the error occured, the duration how
+    /// The instant represents when the error occurred, the duration how
     /// long to wait.
     Delay(Instant, Duration),
 
-    /// The response has been received and the query is done.
+    /// A response has been received and the query is done.
     Done,
 }
 
-/// The reply to a NewConn request.
-type ChanResp<CR> = Result<ChanRespOk<CR>, Arc<std::io::Error>>;
+/// The response to a connection request.
+type ChanResp<Req> = Result<ChanRespOk<Req>, Arc<std::io::Error>>;
 
-/// Response to the DNS request sent by [InnerConnection::run] to [Query].
+/// The successful response to a connection request.
 #[derive(Debug)]
-struct ChanRespOk<CR> {
-    /// id of this connection.
+struct ChanRespOk<Req> {
+    /// The id of this connection.
     id: u64,
 
-    /// New octet_stream transport.
-    conn: octet_stream::Connection<CR>,
+    /// The new stream transport to use for sending a request.
+    conn: Arc<stream::Connection<Req>>,
 }
 
-impl<CR: ComposeRequest + Clone + 'static> ReqResp<CR> {
-    /// Constructor for [ReqResp], takes a DNS request and a receiver for the
-    /// reply.
-    fn new(
-        conn: Connection<CR>,
-        request_msg: &CR,
-        receiver: oneshot::Receiver<ChanResp<CR>>,
-    ) -> ReqResp<CR> {
+impl<Req> Query<Req> {
+    /// Creates a new query.
+    fn new(conn: Connection<Req>, request_msg: Req) -> Self {
         Self {
             conn,
-            request_msg: request_msg.clone(),
-            state: QueryState::GetConn(receiver),
-            conn_id: 0,
+            request_msg,
+            state: QueryState::RequestConn,
+            conn_id: None,
             delayed_retry_count: 0,
         }
     }
+}
 
+impl<Req: ComposeRequest + Clone> Query<Req> {
     /// Get the result of a DNS request.
     ///
-    /// This function returns the reply to a DNS request wrapped in a
-    /// [Result].
-    pub async fn get_response_impl(
-        &mut self,
-    ) -> Result<Message<Bytes>, Error> {
+    /// This function is cancellation safe. If its future is dropped before
+    /// it is resolved, you can call it again to get a new future.
+    pub async fn get_response(&mut self) -> Result<Message<Bytes>, Error> {
         loop {
             match self.state {
-                QueryState::GetConn(ref mut receiver) => {
-                    let res = receiver.await;
-                    if res.is_err() {
-                        // Assume receive error
-                        self.state = QueryState::Done;
-                        return Err(Error::StreamReceiveError);
-                    }
-                    let res = res.expect("error is checked before");
+                QueryState::RequestConn => {
+                    let rx = match self.conn.new_conn(self.conn_id).await {
+                        Ok(rx) => rx,
+                        Err(err) => {
+                            self.state = QueryState::Done;
+                            return Err(err);
+                        }
+                    };
+                    self.state = QueryState::ReceiveConn(rx);
+                }
+                QueryState::ReceiveConn(ref mut receiver) => {
+                    let res = match receiver.await {
+                        Ok(res) => res,
+                        Err(_) => {
+                            // Assume receive error
+                            self.state = QueryState::Done;
+                            return Err(Error::StreamReceiveError);
+                        }
+                    };
 
                     // Another Result. This time from executing the request
                     match res {
@@ -249,7 +304,7 @@ impl<CR: ComposeRequest + Clone + 'static> ReqResp<CR> {
                             let id = ok_res.id;
                             let conn = ok_res.conn;
 
-                            self.conn_id = id;
+                            self.conn_id = Some(id);
                             self.state = QueryState::StartQuery(conn);
                             continue;
                         }
@@ -257,20 +312,11 @@ impl<CR: ComposeRequest + Clone + 'static> ReqResp<CR> {
                 }
                 QueryState::StartQuery(ref mut conn) => {
                     let msg = self.request_msg.clone();
-                    let query_res = conn.query_no_check(&msg).await;
+                    let query_res = conn.start_request(msg.clone()).await;
                     match query_res {
                         Err(err) => {
                             if let Error::ConnectionClosed = err {
-                                let (tx, rx) = oneshot::channel();
-                                let res = self
-                                    .conn
-                                    .new_conn(self.conn_id, tx)
-                                    .await;
-                                if let Err(err) = res {
-                                    self.state = QueryState::Done;
-                                    return Err(err);
-                                }
-                                self.state = QueryState::GetConn(rx);
+                                self.state = QueryState::RequestConn;
                                 continue;
                             }
                             return Err(err);
@@ -282,34 +328,28 @@ impl<CR: ComposeRequest + Clone + 'static> ReqResp<CR> {
                     }
                 }
                 QueryState::GetResult(ref mut query) => {
-                    let reply = query.get_result().await;
-
-                    if reply.is_err() {
-                        self.delayed_retry_count += 1;
-                        let retry_time = retry_time(self.delayed_retry_count);
-                        self.state =
-                            QueryState::Delay(Instant::now(), retry_time);
-                        continue;
+                    match query.get_response().await {
+                        Ok(reply) => return Ok(reply),
+                        // XXX This replicates the previous behavior. But
+                        //     maybe we should have a whole category of
+                        //     fatal errors where retrying doesn’t make any
+                        //     sense?
+                        Err(Error::WrongReplyForQuery) => {
+                            return Err(Error::WrongReplyForQuery)
+                        }
+                        Err(_) => {
+                            self.delayed_retry_count += 1;
+                            let retry_time =
+                                retry_time(self.delayed_retry_count);
+                            self.state =
+                                QueryState::Delay(Instant::now(), retry_time);
+                            continue;
+                        }
                     }
-
-                    let msg = reply.expect("error is checked before");
-                    let request_msg = self.request_msg.to_message();
-
-                    if !is_answer_ignore_id(&msg, &request_msg) {
-                        return Err(Error::WrongReplyForQuery);
-                    }
-                    return Ok(msg);
                 }
                 QueryState::Delay(instant, duration) => {
                     sleep_until(instant + duration).await;
-                    let (tx, rx) = oneshot::channel();
-                    let res = self.conn.new_conn(self.conn_id, tx).await;
-                    if let Err(err) = res {
-                        self.state = QueryState::Done;
-                        return Err(err);
-                    }
-                    self.state = QueryState::GetConn(rx);
-                    continue;
+                    self.state = QueryState::RequestConn;
                 }
                 QueryState::Done => {
                     panic!("Already done");
@@ -319,102 +359,78 @@ impl<CR: ComposeRequest + Clone + 'static> ReqResp<CR> {
     }
 }
 
-impl<CR: ComposeRequest + Clone + 'static> GetResponse for ReqResp<CR> {
+impl<Req: ComposeRequest + Clone + 'static> GetResponse for Query<Req> {
     fn get_response(
         &mut self,
     ) -> Pin<
         Box<dyn Future<Output = Result<Message<Bytes>, Error>> + Send + '_>,
     > {
-        Box::pin(self.get_response_impl())
+        Box::pin(Self::get_response(self))
     }
 }
 
-//------------ InnerConnection ------------------------------------------------
+//------------ Transport ------------------------------------------------
 
 /// The actual implementation of [Connection].
 #[derive(Debug)]
-struct InnerConnection<CR> {
+pub struct Transport<Remote, Req> {
     /// User configuration values.
     config: Config,
 
-    /// [InnerConnection::sender] and [InnerConnection::receiver] are
-    /// part of a single channel.
-    ///
-    /// Used by [ReqResp] to send requests to [InnerConnection::run].
-    sender: mpsc::Sender<ChanReq<CR>>,
+    /// The remote destination.
+    stream: Remote,
 
-    /// receiver part of the channel.
-    ///
-    /// Protected by a mutex to allow read/write access by
-    /// [InnerConnection::run].
-    /// The Option is to allow [InnerConnection::run] to signal that the
-    /// connection is closed.
-    receiver: Mutex<Option<mpsc::Receiver<ChanReq<CR>>>>,
+    /// Underlying stream connection.
+    conn_state: SingleConnState3<Req>,
+
+    /// Current connection id.
+    conn_id: u64,
+
+    /// Receiver part of the channel.
+    receiver: mpsc::Receiver<ChanReq<Req>>,
 }
 
 #[derive(Debug)]
-/// A request to [Connection::run] either for a new octet_stream or to
+/// A request to [Connection::run] either for a new stream or to
 /// shutdown.
-struct ChanReq<CR> {
+struct ChanReq<Req> {
     /// A requests consists of a command.
-    cmd: ReqCmd<CR>,
+    cmd: ReqCmd<Req>,
 }
 
 #[derive(Debug)]
 /// Commands that can be requested.
-enum ReqCmd<CR> {
+enum ReqCmd<Req> {
     /// Request for a (new) connection.
     ///
     /// The id of the previous connection (if any) is passed as well as a
     /// channel to send the reply.
-    NewConn(Option<u64>, ReplySender<CR>),
+    NewConn(Option<u64>, ReplySender<Req>),
 
     /// Shutdown command.
     Shutdown,
 }
 
 /// This is the type of sender in [ReqCmd].
-type ReplySender<CR> = oneshot::Sender<ChanResp<CR>>;
+type ReplySender<Req> = oneshot::Sender<ChanResp<Req>>;
 
-/// Internal datastructure of [InnerConnection::run] to keep track of
-/// the status of the connection.
-// The types Status and ConnState are only used in InnerConnection
-struct State3<'a, S, IO, CR> {
-    /// Underlying octet_stream connection.
-    conn_state: SingleConnState3<CR>,
-
-    /// Current connection id.
-    conn_id: u64,
-
-    /// Connection stream for new octet streams.
-    stream: S,
-
-    /// Collection of futures for the async run function of the underlying
-    /// octet_stream.
-    runners: FuturesUnordered<
-        Pin<Box<dyn Future<Output = Option<()>> + Send + 'a>>,
-    >,
-
-    /// Phantom data for type IO
-    phantom: PhantomData<&'a IO>,
-}
-
-/// State of the current underlying octet_stream transport.
-enum SingleConnState3<CR> {
-    /// No current octet_stream transport.
+/// State of the current underlying stream transport.
+#[derive(Debug)]
+enum SingleConnState3<Req> {
+    /// No current stream transport.
     None,
 
-    /// Current octet_stream transport.
-    Some(octet_stream::Connection<CR>),
+    /// Current stream transport.
+    Some(Arc<stream::Connection<Req>>),
 
     /// State that deals with an error getting a new octet stream from
     /// a connection stream.
     Err(ErrorState),
 }
 
-/// State associated with a failed attempt to create a new octet_stream
+/// State associated with a failed attempt to create a new stream
 /// transport.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ErrorState {
     /// The error we got from the most recent attempt.
     error: Arc<std::io::Error>,
@@ -429,68 +445,43 @@ struct ErrorState {
     timeout: Duration,
 }
 
-impl<CR: ComposeRequest + Clone + 'static> InnerConnection<CR> {
-    /// Constructor for [InnerConnection].
-    ///
-    /// This is the implementation of [Connection::new].
-    pub fn new(config: Config) -> Result<Self, Error> {
-        let (tx, rx) = mpsc::channel(DEF_CHAN_CAP);
-        Ok(Self {
-            config,
-            sender: tx,
-            receiver: Mutex::new(Some(rx)),
-        })
+impl<Remote, Req> Transport<Remote, Req> {
+    /// Creates a new transport.
+    fn new(
+        stream: Remote,
+        config: Config,
+    ) -> (mpsc::Sender<ChanReq<Req>>, Self) {
+        let (sender, receiver) = mpsc::channel(DEF_CHAN_CAP);
+        (
+            sender,
+            Self {
+                config,
+                stream,
+                conn_state: SingleConnState3::None,
+                conn_id: 0,
+                receiver,
+            },
+        )
     }
+}
 
-    /// Main execution function for [InnerConnection].
-    ///
-    /// This function Gets called by [Connection::run].
-    /// This function is not async cancellation safe.
-    /// Make sure the resulting future does not contain a reference to self.
-    pub fn run<
-        S: AsyncConnect<Connection = C> + Send + 'static,
-        C: 'static + AsyncRead + AsyncWrite + Debug + Send + Sync + Unpin,
-    >(
-        &self,
-        stream: S,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send>> {
-        let mut receiver = self.receiver.lock().unwrap();
-        let opt_receiver = receiver.take();
-        drop(receiver);
-
-        Box::pin(Self::run_impl(self.config.clone(), stream, opt_receiver))
-    }
-
-    /// Implementation of the run method. This function does not have
-    /// a reference to self.
-    #[rustfmt::skip]
-    async fn run_impl<
-        'a,
-        S: AsyncConnect<Connection = C> + Send,
-        C: 'static + AsyncRead + AsyncWrite + Debug + Send + Unpin,
-    >(
-	config: Config,
-        stream: S,
-	opt_receiver: Option<mpsc::Receiver<ChanReq<CR>>>
-    ) -> Result<(), Error> {
-        let mut receiver = {
-            opt_receiver.expect("no receiver present?")
-        };
-        let mut curr_cmd: Option<ReqCmd<CR>> = None;
-
-        let mut state = State3::<'a, S, C, CR> {
-            conn_state: SingleConnState3::None,
-            conn_id: 0,
-            stream,
-            runners: FuturesUnordered::<
-                Pin<Box<dyn Future<Output = Option<()>> + Send>>,
-            >::new(),
-            phantom: PhantomData,
-        };
-
+impl<Remote, Req: ComposeRequest> Transport<Remote, Req>
+where
+    Remote: AsyncConnect,
+    Remote::Connection: AsyncRead + AsyncWrite,
+    Req: ComposeRequest,
+{
+    /// Run the transport machinery.
+    pub async fn run(mut self) {
+        let mut curr_cmd: Option<ReqCmd<Req>> = None;
         let mut do_stream = false;
+        let mut runners = FuturesUnordered::new();
         let mut stream_fut: Pin<
-            Box<dyn Future<Output = Result<C, std::io::Error>> + Send>,
+            Box<
+                dyn Future<
+                        Output = Result<Remote::Connection, std::io::Error>,
+                    > + Send,
+            >,
         > = Box::pin(stream_nop());
         let mut opt_chan = None;
 
@@ -501,7 +492,7 @@ impl<CR: ComposeRequest + Clone + 'static> InnerConnection<CR> {
                 match req {
                     ReqCmd::NewConn(opt_id, chan) => {
                         if let SingleConnState3::Err(error_state) =
-                            &state.conn_state
+                            &self.conn_state
                         {
                             if error_state.timer.elapsed()
                                 < error_state.timeout
@@ -521,20 +512,20 @@ impl<CR: ComposeRequest + Clone + 'static> InnerConnection<CR> {
                         // Check if the command has an id greather than the
                         // current id.
                         if let Some(id) = opt_id {
-                            if id >= state.conn_id {
+                            if id >= self.conn_id {
                                 // We need a new connection. Remove the
                                 // current one. This is the best place to
                                 // increment conn_id.
-                                state.conn_id += 1;
-                                state.conn_state = SingleConnState3::None;
+                                self.conn_id += 1;
+                                self.conn_state = SingleConnState3::None;
                             }
                         }
                         // If we still have a connection then we can reply
                         // immediately.
-                        if let SingleConnState3::Some(conn) = &state.conn_state
+                        if let SingleConnState3::Some(conn) = &self.conn_state
                         {
                             let resp = ChanResp::Ok(ChanRespOk {
-                                id: state.conn_id,
+                                id: self.conn_id,
                                 conn: conn.clone(),
                             });
                             // Ignore errors. We don't care if the receiver
@@ -542,7 +533,7 @@ impl<CR: ComposeRequest + Clone + 'static> InnerConnection<CR> {
                             _ = chan.send(resp);
                         } else {
                             opt_chan = Some(chan);
-                            stream_fut = Box::pin(state.stream.connect());
+                            stream_fut = Box::pin(self.stream.connect());
                             do_stream = true;
                         }
                     }
@@ -551,7 +542,7 @@ impl<CR: ComposeRequest + Clone + 'static> InnerConnection<CR> {
             }
 
             if do_stream {
-                let runners_empty = state.runners.is_empty();
+                let runners_empty = runners.is_empty();
 
                 loop {
                     tokio::select! {
@@ -559,57 +550,55 @@ impl<CR: ComposeRequest + Clone + 'static> InnerConnection<CR> {
                             do_stream = false;
                             stream_fut = Box::pin(stream_nop());
 
-                            if let Err(error) = res_conn {
-                                let error = Arc::new(error);
-                                match state.conn_state {
-                                    SingleConnState3::None =>
-                                        state.conn_state =
-                                        SingleConnState3::Err(ErrorState {
-                                            error: error.clone(),
-                                            retries: 0,
-                                            timer: Instant::now(),
-                                            timeout: retry_time(0),
-                                        }),
-                                    SingleConnState3::Some(_) =>
-                                        panic!("Illegal Some state"),
-                                    SingleConnState3::Err(error_state) => {
-                                        state.conn_state =
-                                        SingleConnState3::Err(ErrorState {
-                                            error: error_state.error.clone(),
-                                            retries: error_state.retries+1,
-                                            timer: Instant::now(),
-                                            timeout: retry_time(
-                                            error_state.retries+1),
-                                        });
+                            let stream = match res_conn {
+                                Ok(stream) => stream,
+                                Err(error) => {
+                                    let error = Arc::new(error);
+                                    match self.conn_state {
+                                        SingleConnState3::None =>
+                                            self.conn_state =
+                                            SingleConnState3::Err(ErrorState {
+                                                error: error.clone(),
+                                                retries: 0,
+                                                timer: Instant::now(),
+                                                timeout: retry_time(0),
+                                            }),
+                                        SingleConnState3::Some(_) =>
+                                            panic!("Illegal Some state"),
+                                        SingleConnState3::Err(error_state) => {
+                                            self.conn_state =
+                                            SingleConnState3::Err(ErrorState {
+                                                error:
+                                                    error_state.error.clone(),
+                                                retries: error_state.retries+1,
+                                                timer: Instant::now(),
+                                                timeout: retry_time(
+                                                error_state.retries+1),
+                                            });
+                                        }
                                     }
+
+                                    let resp = ChanResp::Err(error);
+                                    let loc_opt_chan = opt_chan.take();
+
+                                    // Ignore errors. We don't care if the receiver
+                                    // is gone
+                                    _ = loc_opt_chan.expect("weird, no channel?")
+                                        .send(resp);
+                                    break;
                                 }
-
-                                let resp = ChanResp::Err(error);
-                                let loc_opt_chan = opt_chan.take();
-
-                                // Ignore errors. We don't care if the receiver
-                                // is gone
-                                _ = loc_opt_chan.expect("weird, no channel?")
-                                    .send(resp);
-                                break;
-                            }
-
-                            let stream = res_conn
-                                .expect("error case is checked before");
-                            let conn = octet_stream::Connection::new(config.octet_stream.clone())?;
-                            let conn_run = conn.clone();
-
-                            let clo = || async move {
-                                conn_run.run(stream).await
                             };
-                            let fut = clo();
-                            state.runners.push(Box::pin(fut));
+                            let (conn, tran) = stream::Connection::with_config(
+                                stream, self.config.stream.clone()
+                            );
+                            let conn = Arc::new(conn);
+                            runners.push(Box::pin(tran.run()));
 
                             let resp = ChanResp::Ok(ChanRespOk {
-                                id: state.conn_id,
+                                id: self.conn_id,
                                 conn: conn.clone(),
                             });
-                            state.conn_state = SingleConnState3::Some(conn);
+                            self.conn_state = SingleConnState3::Some(conn);
 
                             let loc_opt_chan = opt_chan.take();
 
@@ -619,7 +608,7 @@ impl<CR: ComposeRequest + Clone + 'static> InnerConnection<CR> {
                                 .send(resp);
                             break;
                         }
-                        _ = state.runners.next(), if !runners_empty => {
+                        _ = runners.next(), if !runners_empty => {
                             }
                     }
                 }
@@ -627,67 +616,28 @@ impl<CR: ComposeRequest + Clone + 'static> InnerConnection<CR> {
             }
 
             assert!(curr_cmd.is_none());
-            let recv_fut = receiver.recv();
-            let runners_empty = state.runners.is_empty();
+            let recv_fut = self.receiver.recv();
+            let runners_empty = runners.is_empty();
             tokio::select! {
                 msg = recv_fut => {
                     if msg.is_none() {
-			// All references to the connection object have been
-			// dropped. Shutdown.
+            // All references to the connection object have been
+            // dropped. Shutdown.
                         break;
                     }
                     curr_cmd = Some(msg.expect("None is checked before").cmd);
                 }
-                _ = state.runners.next(), if !runners_empty => {
+                _ = runners.next(), if !runners_empty => {
                     }
             }
         }
 
         // Avoid new queries
-        drop(receiver);
+        drop(self.receiver);
 
-        // Wait for existing octet_stream runners to terminate
-        while !state.runners.is_empty() {
-            state.runners.next().await;
-        }
-
-        // Done
-        Ok(())
-    }
-
-    /// Request a new connection.
-    async fn new_conn(
-        &self,
-        opt_id: Option<u64>,
-        sender: oneshot::Sender<ChanResp<CR>>,
-    ) -> Result<(), Error> {
-        let req = ChanReq {
-            cmd: ReqCmd::NewConn(opt_id, sender),
-        };
-        match self.sender.send(req).await {
-            Err(_) =>
-            // Send error. The receiver is gone, this means that the
-            // connection is closed.
-            {
-                Err(Error::ConnectionClosed)
-            }
-            Ok(_) => Ok(()),
-        }
-    }
-
-    /// Request a shutdown.
-    async fn shutdown(&self) -> Result<(), &'static str> {
-        let req = ChanReq {
-            cmd: ReqCmd::Shutdown,
-        };
-        match self.sender.send(req).await {
-            Err(_) =>
-            // Send error. The receiver is gone, this means that the
-            // connection is closed.
-            {
-                Err(ERR_CONN_CLOSED)
-            }
-            Ok(_) => Ok(()),
+        // Wait for existing stream runners to terminate
+        while !runners.is_empty() {
+            runners.next().await;
         }
     }
 }
@@ -706,55 +656,8 @@ fn retry_time(retries: u64) -> Duration {
     Duration::from_micros(to_usecs as u64)
 }
 
-/// Check if a message is the reply to a query.
-///
-/// Avoid checking the id field because the id has been changed in the
-/// query that was actually issued.
-fn is_answer_ignore_id<
-    Octs1: Octets + AsRef<[u8]>,
-    Octs2: Octets + AsRef<[u8]>,
->(
-    reply: &Message<Octs1>,
-    query: &Message<Octs2>,
-) -> bool {
-    let reply_header = reply.header();
-    let reply_hcounts = reply.header_counts();
-
-    // First check qr is set
-    if !reply_header.qr() {
-        return false;
-    }
-
-    // If the result is an error, then the question
-    // section can be empty. In that case we require all other sections
-    // to be empty as well.
-    if reply_header.rcode() != Rcode::NoError
-        && reply_hcounts.qdcount() == 0
-        && reply_hcounts.ancount() == 0
-        && reply_hcounts.nscount() == 0
-        && reply_hcounts.arcount() == 0
-    {
-        // We can accept this as a valid reply.
-        return true;
-    }
-
-    // Remaining checks. The question section in the reply has to be the
-    // same as in the query.
-    if reply_hcounts.qdcount() != query.header_counts().qdcount() {
-        false
-    } else {
-        reply.question() == query.question()
-    }
-}
-
 /// Helper function to create an empty future that is compatible with the
 /// future returned by a connection stream.
 async fn stream_nop<IO>() -> Result<IO, std::io::Error> {
     Err(io::Error::new(io::ErrorKind::Other, "nop"))
-}
-
-/// Check if config is valid.
-fn check_config(_config: &Config) -> Result<(), Error> {
-    // Nothing to check at the moment.
-    Ok(())
 }

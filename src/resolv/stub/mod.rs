@@ -126,10 +126,10 @@ impl StubResolver {
         &self,
     ) -> redundant::Connection<CR> {
         // Create a redundant transport and fill it with the right transports
-        let redun = redundant::Connection::new(None).unwrap();
+        let (redun, transp) = redundant::Connection::new();
 
         // Start the run function on a separate task.
-        let redun_run_fut = redun.run();
+        let redun_run_fut = transp.run();
 
         // It would be nice to have just one task. However redun.run() has to
         // execute before we can call redun.add(). However, we need to know
@@ -413,7 +413,7 @@ impl<'a> Query<'a> {
         let request_msg = RequestMessage::new(msg);
 
         let transport = self.resolver.get_transport().await;
-        let mut gr_fut = transport.send_request(&request_msg).await.unwrap();
+        let mut gr_fut = transport.send_request(request_msg);
         let reply =
             timeout(self.resolver.options.timeout, gr_fut.get_response())
                 .await

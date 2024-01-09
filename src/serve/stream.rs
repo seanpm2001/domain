@@ -11,8 +11,8 @@ use std::{
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
-use futures::{
+use futures_util::StreamExt;
+use futures_util::{
     future::{select, Either},
     pin_mut,
 };

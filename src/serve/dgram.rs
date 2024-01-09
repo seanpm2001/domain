@@ -16,8 +16,8 @@ use super::{
     sock::AsyncDgramSock,
 };
 
-use futures::future::Either;
-use futures::{future::select, pin_mut, StreamExt};
+use futures_util::future::Either;
+use futures_util::{future::select, pin_mut, StreamExt};
 use tokio::{io::ReadBuf, sync::watch};
 
 //------------ DgramServer ---------------------------------------------------

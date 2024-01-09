@@ -1,7 +1,7 @@
 use std::string::String;
 use std::time::Duration;
 
-use futures::{Future, Stream};
+use futures_util::{future::Future, stream::Stream};
 
 use octseq::OctetsBuilder;
 use crate::base::{Message, StreamTarget};

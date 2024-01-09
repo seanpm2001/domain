@@ -1,6 +1,6 @@
 //! Network socket abstractions.
 
-use futures::Future;
+use futures_util::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::ops::Deref;
@@ -82,7 +82,7 @@ impl AsyncAccept for TcpListener {
     type Addr = SocketAddr;
     type Error = io::Error;
     type StreamType = TcpStream;
-    type Stream = futures::future::Ready<Result<Self::StreamType, io::Error>>;
+    type Stream = futures_util::future::Ready<Result<Self::StreamType, io::Error>>;
 
     #[allow(clippy::type_complexity)]
     fn poll_accept(
@@ -91,7 +91,7 @@ impl AsyncAccept for TcpListener {
     ) -> Poll<Result<(Self::Stream, Self::Addr), io::Error>> {
         TcpListener::poll_accept(self, cx).map(|res| {
             res.map(|(stream, addr)| {
-                (futures::future::ready(Ok(stream)), addr)
+                (futures_util::future::ready(Ok(stream)), addr)
             })
         })
     }

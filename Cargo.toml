@@ -75,8 +75,10 @@ unstable-server-transport = ["arc-swap", "chrono/clock", "hex", "libc", "tracing
 #mock-time = ["mock_instant"]
 
 [dev-dependencies]
+clap       = { version = "=4.3.12", features = ["derive"] }
 rstest       = "0.18.2"
 rustls       = { version = "0.21.9" }
+serde_json = "1.0.107"
 serde_test   = "1.0.130"
 serde_json   = "1.0.113"
 serde_yaml   = "0.9"
@@ -123,3 +125,7 @@ required-features = ["net", "unstable-client-transport"]
 [[example]]
 name = "server-transports"
 required-features = ["net", "unstable-server-transport"]
+
+[[example]]
+name = "simple-proxy"
+required-features = ["net", "unstable-client-transport", "unstable-server-transport", "serde"]

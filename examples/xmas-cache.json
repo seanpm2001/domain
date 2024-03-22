@@ -1,0 +1,82 @@
+{
+    "upstream":
+    {
+	"cache":
+	{
+	    "upstream":
+	    {
+		"redundant":
+		{
+		    "transports":
+		    [
+			{
+			    "cache":
+			    {
+				"upstream":
+				{
+				    "UDP-only":
+				    {
+					"servername": "dns.google",
+					"addr": "1.1.1.1"
+				    }
+				}
+			    }
+			},
+			{
+			    "cache":
+			    {
+				"upstream":
+				{
+				    "TLS":
+				    {
+					"servername": "dns.google",
+					"addr": "1.1.1.1"
+				    }
+				}
+			    }
+			},
+			{
+			    "cache":
+			    {
+				"upstream":
+				{
+				    "UDP":
+				    {
+					"servername": "dns.google",
+					"addr": "8.8.8.8"
+				    }
+				}
+			    }
+			},
+			{
+			    "cache":
+			    {
+				"upstream":
+				{
+				    "TLS":
+				    {
+					"servername": "dns.google",
+					"addr": "8.8.8.8"
+				    }
+				}
+			    }
+			},
+			{
+			    "cache":
+			    {
+				"upstream":
+				{
+				    "TCP":
+				    {
+					"servername": "dns.google",
+					"addr": "9.9.9.9"
+				    }
+				}
+			    }
+			}
+		    ]
+		}
+	    }
+	}
+    }
+}

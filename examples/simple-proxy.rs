@@ -11,12 +11,6 @@ use domain::base::wire::Composer;
 use domain::base::{Message, MessageBuilder, ParsedDname, StreamTarget};
 use domain::dep::octseq::Octets;
 use domain::dep::octseq::OctetsBuilder;
-use domain::base::message_builder::PushError;
-use domain::base::opt::{Opt, OptRecord};
-use domain::base::{
-    Message, MessageBuilder, ParsedDname, StaticCompressor, StreamTarget,
-};
-use domain::dep::octseq::Octets;
 use domain::net::client::dgram;
 use domain::net::client::dgram_stream;
 use domain::net::client::multi_stream;
@@ -37,13 +31,6 @@ use domain::net::server::service::{
     CallResult, Service, ServiceError, ServiceResult,
 };
 use domain::rdata::AllRecordData;
-use domain::rdata::AllRecordData;
-use domain::net::server::buf::BufSource;
-use domain::net::server::dgram::DgramServer;
-use domain::net::server::service::{
-    CallResult, Service, ServiceError, Transaction,
-};
-use futures_util::stream::Stream;
 use futures_util::{future::BoxFuture, FutureExt};
 use rustls::ClientConfig;
 use serde::Deserialize;
@@ -51,7 +38,6 @@ use serde::Serialize;
 use std::fmt::Debug;
 use std::fs::File;
 use std::future::Future;
-use std::marker::PhantomData;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::str::FromStr;

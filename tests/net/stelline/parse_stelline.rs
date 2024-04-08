@@ -396,7 +396,8 @@ pub struct AdditionalSection {
 #[derive(Clone, Debug, Default)]
 pub struct Sections {
     pub question: Vec<parse_query::Entry>,
-    pub answer: Vec<ZonefileEntry>,
+    /// The answer, or possible answers (only one should be served)
+    pub answers: Vec<Vec<ZonefileEntry>>,
     pub authority: Vec<ZonefileEntry>,
     pub additional: AdditionalSection,
 }
@@ -412,6 +413,7 @@ fn parse_section<Lines: Iterator<Item = Result<String, std::io::Error>>>(
     } else {
         panic!("Bad section {next}");
     };
+    let mut answer: Option<&mut Vec<ZonefileEntry>> = None;
     // Should extract which section
     loop {
         let line = l.next().unwrap().unwrap();
@@ -474,6 +476,17 @@ fn parse_section<Lines: Iterator<Item = Result<String, std::io::Error>>>(
                             .extend(edns_line_bytes);
                     }
                 } else {
+                    // Start a new answer if an "$OR" directive is detected.
+                    if clean_line.starts_with("$OR") {
+                        answer = None;
+                        continue;
+                    }
+
+                    if answer.is_none() {
+                        sections.answers.push(vec![]);
+                        answer = sections.answers.last_mut();
+                    }
+
                     let mut zonefile = Zonefile::new();
                     zonefile.extend_from_slice(b"$ORIGIN .\n");
                     zonefile.extend_from_slice(b"ignore 3600 in ns ignore\n");
@@ -485,7 +498,7 @@ fn parse_section<Lines: Iterator<Item = Result<String, std::io::Error>>>(
                     let e = e.unwrap();
                     match section {
                         Section::Question => unreachable!(),
-                        Section::Answer => sections.answer.push(e),
+                        Section::Answer => answer.as_mut().unwrap().push(e),
                         Section::Authority => sections.authority.push(e),
                         Section::Additional => {
                             sections.additional.zone_entries.push(e)

@@ -1,0 +1,243 @@
+; Based on: https://datatracker.ietf.org/doc/html/rfc1034#section-6.2
+; config options
+auth-zone:
+	zonefile:
+TEMPFILE_NAME .
+TEMPFILE_CONTENTS .
+.       IN      SOA     SRI-NIC.ARPA. HOSTMASTER.SRI-NIC.ARPA. (
+						870611          ;serial
+						1800            ;refresh every 30 min
+						300             ;retry every 5 min
+						604800          ;expire after a week
+						86400)          ;minimum of a day
+				NS      A.ISI.EDU.
+				NS      C.ISI.EDU.
+				NS      SRI-NIC.ARPA.
+
+MIL.    86400   NS      SRI-NIC.ARPA.
+		86400   NS      A.ISI.EDU.
+
+EDU.    86400   NS      SRI-NIC.ARPA.
+		86400   NS      C.ISI.EDU.
+
+SRI-NIC.ARPA.   A       26.0.0.73
+				A       10.0.0.51
+				MX      0 SRI-NIC.ARPA.
+				HINFO   DEC-2060 TOPS20
+
+ACC.ARPA.       A       26.6.0.65
+				HINFO   PDP-11/70 UNIX
+				MX      10 ACC.ARPA.
+
+USC-ISIC.ARPA.  CNAME   C.ISI.EDU.
+
+73.0.0.26.IN-ADDR.ARPA.  PTR    SRI-NIC.ARPA.
+65.0.6.26.IN-ADDR.ARPA.  PTR    ACC.ARPA.
+51.0.0.10.IN-ADDR.ARPA.  PTR    SRI-NIC.ARPA.
+52.0.0.10.IN-ADDR.ARPA.  PTR    C.ISI.EDU.
+103.0.3.26.IN-ADDR.ARPA. PTR    A.ISI.EDU.
+
+A.ISI.EDU. 86400 A      26.3.0.103
+C.ISI.EDU. 86400 A      10.0.0.52
+TEMPFILE_END
+TEMPFILE_NAME edu.
+TEMPFILE_CONTENTS edu.
+EDU.  IN SOA SRI-NIC.ARPA. HOSTMASTER.SRI-NIC.ARPA. (
+						870729 ;serial
+						1800 ;refresh every 30 minutes
+						300 ;retry every 5 minutes
+						604800 ;expire after a week
+						86400 ;minimum of a day
+						)
+				NS SRI-NIC.ARPA.
+				NS C.ISI.EDU.
+
+UCI 172800 NS ICS.UCI
+				172800 NS ROME.UCI
+ICS.UCI 172800 A 192.5.19.1
+ROME.UCI 172800 A 192.5.19.31
+ISI 172800 NS VAXA.ISI
+				172800 NS A.ISI
+				172800 NS VENERA.ISI.EDU.
+VAXA.ISI 172800 A 10.2.0.27
+				172800 A 128.9.0.33
+VENERA.ISI.EDU. 172800 A 10.1.0.52
+				172800 A 128.9.0.32
+A.ISI 172800 A 26.3.0.103
+
+UDEL.EDU.  172800 NS LOUIE.UDEL.EDU.
+				172800 NS UMN-REI-UC.ARPA.
+LOUIE.UDEL.EDU. 172800 A 10.0.0.96
+				172800 A 192.5.39.3
+
+YALE.EDU.  172800 NS YALE.ARPA.
+YALE.EDU.  172800 NS YALE-BULLDOG.ARPA.
+
+MIT.EDU.  43200 NS XX.LCS.MIT.EDU.
+					43200 NS ACHILLES.MIT.EDU.
+XX.LCS.MIT.EDU.  43200 A 10.0.0.44
+ACHILLES.MIT.EDU. 43200 A 18.72.0.8
+TEMPFILE_END
+CONFIG_END
+
+SCENARIO_BEGIN Test authority zone with zonefile
+
+; Step numbers are in the form 62<S><N> where:
+;   <S> is the 6.2.<S> subsection of RFC 1034 that defines the query and reply.
+;   <N> is 0 for the query and 1 for the reply.
+
+; RFC 1034 6.2.1
+STEP 6210 QUERY
+ENTRY_BEGIN
+REPLY QR
+SECTION QUESTION
+SRI-NIC.ARPA. IN A
+ENTRY_END
+
+STEP 6211 CHECK_ANSWER
+ENTRY_BEGIN
+MATCH all
+REPLY AA QR NOERROR
+SECTION QUESTION
+SRI-NIC.ARPA. IN A
+SECTION ANSWER
+SRI-NIC.ARPA. 86400 IN A 26.0.0.73
+SRI-NIC.ARPA. 86400 IN A 10.0.0.51
+ENTRY_END
+
+; RFC 1034 6.2.2
+; Note: The RFC refers to QTYPE=* which was thereafter referred to as QTYPE=ANY.
+; Note: The expected reply has been modified to reflect updated rules defined
+;       by RFC 8482 regarding how to reply to ANY queries, i.e. we expect the
+;       first RRSET at the matching QNAME to be returned. However, since the
+;       RRSETs are not stored or retrieved in a guaranteed order we don't know
+;       whether the answer will contain the A RRSET, the MX RRSET or the HINFO
+;       RRSET... So we specify each of the possible answers using $OR.
+STEP 6220 QUERY
+ENTRY_BEGIN
+REPLY QR
+SECTION QUESTION
+SRI-NIC.ARPA. IN ANY
+ENTRY_END
+
+STEP 6221 CHECK_ANSWER
+ENTRY_BEGIN
+MATCH all
+REPLY AA QR NOERROR
+SECTION QUESTION
+SRI-NIC.ARPA. IN ANY
+SECTION ANSWER
+SRI-NIC.ARPA. 86400 IN A     26.0.0.73
+SRI-NIC.ARPA. 86400 IN A     10.0.0.51
+$OR
+SRI-NIC.ARPA. 86400 IN MX    0 SRI-NIC.ARPA
+$OR
+SRI-NIC.ARPA. 86400 IN HINFO DEC-2060 TOPS20  
+ENTRY_END
+
+; RFC 1034 6.2.3
+STEP 6230 QUERY
+ENTRY_BEGIN
+REPLY QR
+SECTION QUESTION
+SRI-NIC.ARPA. IN MX
+ENTRY_END
+
+STEP 6231 CHECK_ANSWER
+ENTRY_BEGIN
+MATCH all
+REPLY AA QR NOERROR
+SECTION QUESTION
+SRI-NIC.ARPA. IN MX
+SECTION ANSWER
+SRI-NIC.ARPA. 86400 IN     MX      0 SRI-NIC.ARPA.
+; Commented out because support for returning these additional records is not
+; implemented yet
+;SECTION ADDITIONAL 
+;SRI-NIC.ARPA. 86400 IN     A       26.0.0.73
+;SRI-NIC.ARPA. 86400 IN     A       10.0.0.51
+ENTRY_END
+
+; RFC 1034 6.2.4
+; Commented out because we respond with a SOA in the authority section as
+; well.
+;STEP 6240 QUERY
+;ENTRY_BEGIN
+;REPLY QR
+;SECTION QUESTION
+;SRI-NIC.ARPA.	IN	NS
+;ENTRY_END
+
+;STEP 6241 CHECK_ANSWER
+;ENTRY_BEGIN
+;MATCH all
+;REPLY AA QR NOERROR
+;SECTION QUESTION
+;SRI-NIC.ARPA.	IN	NS
+;ENTRY_END
+
+; RFC 1034 6.2.5
+STEP 6250 QUERY
+ENTRY_BEGIN
+REPLY QR
+SECTION QUESTION
+SIR-NIC.ARPA.	IN	A
+ENTRY_END
+
+STEP 6251 CHECK_ANSWER
+ENTRY_BEGIN
+MATCH all
+REPLY AA QR NXDOMAIN
+SECTION QUESTION
+SIR-NIC.ARPA.	IN	A
+SECTION AUTHORITY
+. SOA SRI-NIC.ARPA. HOSTMASTER.SRI-NIC.ARPA. 870611 1800 300 604800 86400
+ENTRY_END
+
+; RFC 1034 6.2.6
+; Commented out because support for returning these additional records is not
+; implemented yet
+;STEP 6260 QUERY
+;ENTRY_BEGIN
+;REPLY QR
+;SECTION QUESTION
+;BRL.MIL.	IN	A
+;ENTRY_END
+
+;STEP 6261 CHECK_ANSWER
+;ENTRY_BEGIN
+;MATCH all
+;REPLY AA QR NXDOMAIN
+;SECTION QUESTION
+;BRL.MIL.	IN	A
+;SECTION AUTHORITY
+;MIL.			86400	IN	NS	SRI-NIC.ARPA.
+;MIL.			86400	IN	NS	A.ISI.EDU
+;SECTION ADDITIONAL
+;A.ISI.EDU.                	A	26.3.0.103
+;SRI-NIC.ARPA.             	A	26.0.0.73
+;SRI-NIC.ARPA.             	A	10.0.0.51
+;ENTRY_END
+
+; RFC 1034 6.2.7
+; Commented out because support for resolving the CNAME is not implemented
+; yet.
+;STEP 6270 QUERY
+;ENTRY_BEGIN
+;REPLY QR
+;SECTION QUESTION
+;USC-ISIC.ARPA.	IN	A
+;ENTRY_END
+
+;STEP 6271 CHECK_ANSWER
+;ENTRY_BEGIN
+;MATCH all
+;REPLY AA QR NXDOMAIN
+;SECTION QUESTION
+;USC-ISIC.ARPA.	IN	A
+;SECTION ANSWER
+;USC-ISIC.ARPA. 86400 IN CNAME      C.ISI.EDU.
+;C.ISI.EDU.     86400 IN A          10.0.0.52
+;ENTRY_END
+
+SCENARIO_END

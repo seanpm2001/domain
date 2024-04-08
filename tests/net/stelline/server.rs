@@ -76,13 +76,18 @@ where
         }
     }
     let mut msg = msg.answer();
-    for a in &sections.answer {
-        let rec = if let ZonefileEntry::Record(record) = a {
-            record
-        } else {
-            panic!("include not expected")
-        };
-        msg.push(rec).unwrap();
+    if sections.answers.len() > 1 {
+        panic!("multiple answers are not supported");
+    }
+    if let Some(answer) = sections.answers.first() {
+        for a in answer {
+            let rec = if let ZonefileEntry::Record(record) = a {
+                record
+            } else {
+                panic!("include not expected")
+            };
+            msg.push(rec).unwrap();
+        }
     }
     let mut msg = msg.authority();
     for a in &sections.authority {

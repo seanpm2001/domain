@@ -72,20 +72,31 @@ where
             return false;
         }
     }
-    if matches.answer
-        && !match_section(
-            sections.answer.clone(),
-            None,
-            msg.answer().unwrap(),
-            msg.header_counts().ancount(),
-            matches.ttl,
-            verbose,
-        )
-    {
-        if verbose {
-            println!("match_msg: answer section does not match");
+    if matches.answer {
+        // See if any of the possible answers match.
+        // More than one answer is supported for cases such as ANY which can return
+        // one or more RRSETs but not necessarily the same set each time.
+        let mut matched = false;
+        for answer in &sections.answers {
+            if match_section(
+                answer.clone(),
+                None,
+                msg.answer().unwrap(),
+                msg.header_counts().ancount(),
+                matches.ttl,
+                verbose,
+            ) {
+                matched = true;
+                break;
+            }
         }
-        return false;
+
+        if !matched {
+            if verbose {
+                println!("match_msg: answer section does not match");
+            }
+            return false;
+        }
     }
     if matches.authority
         && !match_section(

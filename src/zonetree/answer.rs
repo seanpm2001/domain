@@ -13,7 +13,7 @@ use octseq::Octets;
 /// A DNS answer to a query against a [`Zone`].
 ///
 /// [`Answer`] is the type returned by [`ReadableZone::query`].
-///
+/// 
 /// Callers of [`ReadableZone::query`] will likely only ever need to use the
 /// [`Self::to_message`] function. Alternatively, for complete control use the
 /// getter functions on [`Answer`] instead and construct a response message
@@ -27,7 +27,7 @@ use octseq::Octets;
 ///
 /// [`Zone`]: crate::zonetree::Zone
 /// [`ReadableZone::query`]: crate::zonetree::traits::ReadableZone::query()
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Answer {
     /// The response code of the answer.
     rcode: Rcode,
@@ -103,6 +103,7 @@ impl Answer {
         message: &Message<RequestOctets>,
         builder: MessageBuilder<Target>,
     ) -> AdditionalBuilder<Target> {
+        let mut authority_section_has_non_soa_rrs = false;
         let question = message.sole_question().unwrap();
         let qname = question.qname();
         let qclass = question.qclass();
@@ -138,6 +139,9 @@ impl Answer {
                     .unwrap();
             }
             if let Some(ns) = authority.ns.as_ref() {
+                if !ns.data().is_empty() {
+                    authority_section_has_non_soa_rrs = true;
+                }
                 for item in ns.data() {
                     builder
                         .push((
@@ -150,6 +154,9 @@ impl Answer {
                 }
             }
             if let Some(ref ds) = authority.ds {
+                if !ds.data().is_empty() {
+                    authority_section_has_non_soa_rrs = true;
+                }
                 for item in ds.data() {
                     builder
                         .push((
@@ -162,6 +169,17 @@ impl Answer {
                 }
             }
         }
+
+        // https://datatracker.ietf.org/doc/html/rfc1034#section-3.7
+        // "Authority  Carries RRs which describe other authoritative servers.
+        //             May optionally carry the SOA RR for the authoritative
+        //             data in the answer section."
+        //
+        // So, if there are RRs other than a SOA in the authority section it
+        // means that this is not an authoritative response.
+        builder
+            .header_mut()
+            .set_aa(!authority_section_has_non_soa_rrs);
 
         builder.additional()
     }
@@ -185,7 +203,7 @@ impl Answer {
 //------------ AnswerContent -------------------------------------------------
 
 /// The content of the answer.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum AnswerContent {
     /// An answer consisting of an RRSET.
     Data(SharedRrset),
@@ -200,7 +218,7 @@ pub enum AnswerContent {
 //------------ AnswerAuthority -----------------------------------------------
 
 /// The authority section of a query answer.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AnswerAuthority {
     /// The owner name of the record sets in the authority section.
     owner: StoredDname,

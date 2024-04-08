@@ -494,7 +494,7 @@ fn entry2reqmsg(entry: &Entry) -> RequestMessage<Vec<u8>> {
         msg.push(question).unwrap();
     }
     let msg = msg.answer();
-    for _a in &sections.answer {
+    for _a in &sections.answers {
         todo!();
     }
     let msg = msg.authority();

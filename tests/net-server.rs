@@ -1,14 +1,16 @@
 #![cfg(feature = "net")]
 mod net;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::future::Future;
+use std::io::{BufReader, Read};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use domain::zonetree::{Answer, ZoneTree};
 use octseq::Octets;
 use rstest::rstest;
 use tracing::instrument;
@@ -30,7 +32,7 @@ use domain::net::server::service::{
 };
 use domain::net::server::stream::StreamServer;
 use domain::net::server::util::{mk_builder_for_target, service_fn};
-use domain::zonefile::inplace::{Entry, ScannedRecord, Zonefile};
+use domain::zonefile::inplace::Zonefile;
 
 use net::stelline::channel::ClientServerChannel;
 use net::stelline::client::do_client;
@@ -59,13 +61,23 @@ async fn server_tests(#[files("test-data/server/*.rpl")] rpl_file: PathBuf) {
     // and which responses will be expected, and how the server that
     // answers them should be configured.
 
+    use domain::zonetree::{Zone, ZoneTree};
+
     let file = File::open(&rpl_file).unwrap();
     let stelline = parse_file(&file, rpl_file.to_str().unwrap());
     let server_config = parse_server_config(&stelline.config);
 
+    // Create a zonetree from the zones defined by the config
+    let mut zones = ZoneTree::new();
+    // TODO: get rid of zonefiles.clone()
+    for reader in server_config.zonefiles.clone() {
+        let zone = Zone::try_from(reader).unwrap();
+        zones.insert_zone(zone).unwrap();
+    }
+    let zones = Arc::new(zones);
+
     // Create a service to answer queries received by the DNS servers.
-    let zonefile = server_config.zonefile.clone();
-    let service: Arc<_> = service_fn(test_service, zonefile).into();
+    let service: Arc<_> = service_fn(test_service, zones).into();
 
     // Create dgram and stream servers for answering requests
     let (dgram_srv, dgram_conn, stream_srv, stream_conn) =
@@ -247,7 +259,7 @@ where
 #[allow(clippy::type_complexity)]
 fn test_service(
     request: Request<Vec<u8>>,
-    zonefile: Zonefile,
+    zones: Arc<ZoneTree>,
 ) -> Result<
     Transaction<
         Vec<u8>,
@@ -255,62 +267,28 @@ fn test_service(
     >,
     ServiceError,
 > {
-    fn as_record_and_dname(
-        r: ScannedRecord,
-    ) -> Option<(ScannedRecord, Dname<Vec<u8>>)> {
-        let dname = r.owner().to_dname();
-        Some((r, dname))
-    }
-
-    fn as_records(
-        e: Result<Entry, domain::zonefile::inplace::Error>,
-    ) -> Option<ScannedRecord> {
-        match e {
-            Ok(Entry::Record(r)) => Some(r),
-            Ok(_) => None,
-            Err(err) => panic!(
-                "Error while extracting records from the zonefile: {err}"
-            ),
-        }
-    }
-
     trace!("Service received request");
     Ok(Transaction::single(async move {
         trace!("Service is constructing a single response");
         // If given a single question:
-        let answer = request
-            .message()
-            .sole_question()
-            .ok()
-            .and_then(|q| {
-                // Walk the zone to find the queried name
-                zonefile
-                    .clone()
-                    .filter_map(as_records)
-                    .filter_map(as_record_and_dname)
-                    .find(|(_record, dname)| dname == q.qname())
-            })
-            .map_or_else(
-                || {
-                    // The Qname was not found in the zone:
-                    mk_builder_for_target()
-                        .start_answer(request.message(), Rcode::NXDOMAIN)
-                        .unwrap()
-                },
-                |(record, _)| {
-                    // Respond with the found record:
-                    let mut answer = mk_builder_for_target()
-                        .start_answer(request.message(), Rcode::NOERROR)
-                        .unwrap();
-                    // As we serve all answers from our own zones we are the
-                    // authority for the domain in question.
-                    answer.header_mut().set_aa(true);
-                    answer.push(record).unwrap();
-                    answer
-                },
-            );
+        let question = request.message().sole_question().unwrap();
+        let zone = zones
+            .find_zone(question.qname(), question.qclass())
+            .map(|zone| zone.read());
+        let answer = match zone {
+            Some(zone) => {
+                let qname = question.qname().to_bytes();
+                let qtype = question.qtype();
+                zone.query(qname, qtype).unwrap()
+            }
+            None => Answer::new(Rcode::NXDOMAIN),
+        };
 
-        Ok(CallResult::new(answer.additional()))
+        trace!("Service answer: {:#?}", &answer);
+
+        let builder = mk_builder_for_target();
+        let additional = answer.to_message(request.message(), builder);
+        Ok(CallResult::new(additional))
     }))
 }
 
@@ -321,7 +299,7 @@ struct ServerConfig<'a> {
     cookies: CookieConfig<'a>,
     edns_tcp_keepalive: bool,
     idle_timeout: Option<Duration>,
-    zonefile: Zonefile,
+    zonefiles: Vec<Zonefile>,
 }
 
 #[derive(Default)]
@@ -331,90 +309,289 @@ struct CookieConfig<'a> {
     ip_deny_list: Vec<IpAddr>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum ConfigSection {
+    None,
+    Server,
+    AuthZone,
+    AuthZoneZonefile,
+    StubZone,
+    Unknown,
+}
+
+impl ConfigSection {
+    fn is_indented(&self) -> bool {
+        #[allow(clippy::match_like_matches_macro)]
+        match &self {
+            ConfigSection::None => false,
+            ConfigSection::AuthZoneZonefile => false,
+            _ => true,
+        }
+    }
+}
+
 fn parse_server_config(config: &Config) -> ServerConfig {
     let mut parsed_config = ServerConfig::default();
     let mut zone_file_bytes = VecDeque::<u8>::new();
-    let mut in_server_block = false;
+    let mut tempfiles: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut zone_tempfiles: HashSet<&str> = HashSet::new();
+    let mut cur_tempfile_name: Option<&str> = None;
+    let mut cur_tempfile_lines = Vec::new();
+    let mut cur_section = ConfigSection::None;
 
     for line in config.lines() {
-        if line.starts_with("server:") {
-            in_server_block = true;
-        } else if in_server_block {
-            if !line.starts_with(|c: char| c.is_whitespace()) {
-                in_server_block = false;
-            } else if let Some((setting, value)) = line.trim().split_once(':')
-            {
-                // Trim off whitespace and trailing comments.
-                let setting = setting.trim();
-                let value = value
-                    .split_once('#')
-                    .map_or(value, |(value, _rest)| value)
-                    .trim();
+        if cur_section.is_indented()
+            && !line.starts_with(|c: char| c.is_whitespace())
+        {
+            cur_section = ConfigSection::None;
+        } else if line.trim_start().starts_with('#') {
+            // Skip comment line
+            continue;
+        }
 
-                match (setting, value) {
-                    ("answer-cookie", "yes") => {
-                        parsed_config.cookies.enabled = true
-                    }
-                    ("cookie-secret", v) => {
-                        parsed_config.cookies.secret =
-                            Some(v.trim_matches('"'));
-                    }
-                    ("access-control", v) => {
-                        // TODO: Strictly speaking the "ip" is a netblock
-                        // "given as an IPv4 or IPv6 address /size appended
-                        // for a classless network block", but we only handle
-                        // an IP address here for now.
-                        // See: https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html?highlight=edns-tcp-keepalive#unbound-conf-access-control
-                        if let Some((ip, action)) =
-                            v.split_once(|c: char| c.is_whitespace())
-                        {
-                            match action {
-                                "allow_cookie" => {
-                                    if let Ok(ip) = ip.parse() {
-                                        parsed_config
-                                            .cookies
-                                            .ip_deny_list
-                                            .push(ip);
-                                    } else {
-                                        eprintln!("Ignoring malformed IP address '{ip}' in 'access-control' setting");
+        if matches!(cur_section, ConfigSection::None|ConfigSection::AuthZoneZonefile) {
+            if line.starts_with("server:") {
+                cur_section = ConfigSection::Server;
+                continue;
+            } else if line.starts_with("auth-zone:") {
+                cur_section = ConfigSection::AuthZone;
+                continue;
+            } else if line.starts_with("stub-zone") {
+                cur_section = ConfigSection::StubZone;
+                continue;
+            } else if cur_section == ConfigSection::None {
+                eprintln!("Ignoring unknown section: {line}");
+                cur_section = ConfigSection::Unknown;
+                continue;
+            }
+        }
+
+        match cur_section {
+            ConfigSection::Server => {
+                if let Some((setting, value)) = line.trim().split_once(':') {
+                    // Trim off whitespace and trailing comments.
+                    let setting = setting.trim();
+                    let value = value
+                        .split_once('#')
+                        .map_or(value, |(value, _rest)| value)
+                        .trim();
+
+                    match (setting, value) {
+                        ("answer-cookie", "yes") => {
+                            parsed_config.cookies.enabled = true
+                        }
+                        ("cookie-secret", v) => {
+                            parsed_config.cookies.secret =
+                                Some(v.trim_matches('"'));
+                        }
+                        ("access-control", v) => {
+                            // TODO: Strictly speaking the "ip" is a netblock
+                            // "given as an IPv4 or IPv6 address /size appended
+                            // for a classless network block", but we only handle
+                            // an IP address here for now.
+                            // See: https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html?highlight=edns-tcp-keepalive#unbound-conf-access-control
+                            if let Some((ip, action)) =
+                                v.split_once(|c: char| c.is_whitespace())
+                            {
+                                match action {
+                                    "allow_cookie" => {
+                                        if let Ok(ip) = ip.parse() {
+                                            parsed_config
+                                                .cookies
+                                                .ip_deny_list
+                                                .push(ip);
+                                        } else {
+                                            eprintln!("Ignoring malformed IP address '{ip}' in 'access-control' setting");
+                                        }
                                     }
-                                }
 
-                                _ => {
-                                    eprintln!("Ignoring unknown action '{action}' for 'access-control' setting");
+                                    _ => {
+                                        eprintln!("Ignoring unknown action '{action}' for 'access-control' setting");
+                                    }
                                 }
                             }
                         }
-                    }
-                    ("local-data", v) => {
-                        if !zone_file_bytes.is_empty() {
+                        ("local-data", v) => {
+                            if zone_file_bytes.is_empty() {
+                                zone_file_bytes.extend(
+                                    r#"test.	3600	IN	SOA	test. hostmaster.test. (
+                                    1379078166 28800 7200 604800 7200 )"#
+                                        .as_bytes(),
+                                );
+                            }
+                            zone_file_bytes.push_back(b'\n');
+                            zone_file_bytes.extend(
+                                v.trim_matches('"').as_bytes().iter(),
+                            );
                             zone_file_bytes.push_back(b'\n');
                         }
-                        zone_file_bytes
-                            .extend(v.trim_matches('"').as_bytes().iter());
-                        zone_file_bytes.push_back(b'\n');
-                    }
-                    ("edns-tcp-keepalive", "yes") => {
-                        parsed_config.edns_tcp_keepalive = true;
-                    }
-                    ("edns-tcp-keepalive-timeout", v) => {
-                        if parsed_config.edns_tcp_keepalive {
-                            parsed_config.idle_timeout = Some(
-                                Duration::from_millis(v.parse().unwrap()),
-                            );
+                        ("edns-tcp-keepalive", "yes") => {
+                            parsed_config.edns_tcp_keepalive = true;
+                        }
+                        ("edns-tcp-keepalive-timeout", v) => {
+                            if parsed_config.edns_tcp_keepalive {
+                                parsed_config.idle_timeout = Some(
+                                    Duration::from_millis(v.parse().unwrap()),
+                                );
+                            }
+                        }
+                        _ => {
+                            eprintln!("Ignoring unknown server setting '{setting}' with value: {value}");
                         }
                     }
-                    _ => {
-                        eprintln!("Ignoring unknown server setting '{setting}' with value: {value}");
+                }
+            }
+
+            ConfigSection::AuthZone => {
+                if let Some((setting, value)) = line.trim().split_once(':') {
+                    // Trim off whitespace and trailing comments.
+                    let setting = setting.trim();
+                    let value = value
+                        .split_once('#')
+                        .map_or(value, |(value, _rest)| value)
+                        .trim();
+
+                    match (setting, value) {
+                        ("zonefile", _v) => {
+                            cur_section = ConfigSection::AuthZoneZonefile;
+                        }
+                        (comment, _) if comment.starts_with('#') => {
+                            // Nothing to do
+                        }
+                        _ => {
+                            eprintln!("Ignoring unknown auth-zone setting '{setting}' with value: {value}");
+                        }
                     }
                 }
+            }
+
+            ConfigSection::AuthZoneZonefile => {
+                if let Some((directive, value)) = line.trim().split_once(' ') {
+                    let mut is_known_directive_with_value = true;
+
+                    // Trim off whitespace and trailing comments.
+                    let value = value
+                        .split_once('#')
+                        .map_or(value, |(value, _rest)| value)
+                        .trim();
+
+                    match (directive, value) {
+                        ("TEMPFILE_NAME", tempfile_name) => {
+                            // We don't write a tempfile by this name to disk, we
+                            // instead read the contents directly into a zone tree,
+                            // but we still need to pay attention to this line because
+                            // it tells us which of the "TEMPFILE_CONTENTS" blocks are
+                            // actually zones rather than just fragments included by
+                            // "$INCLUDE_TEMPFILE" directives.
+                            zone_tempfiles.insert(tempfile_name);
+                        }
+                        ("TEMPFILE_CONTENTS", tempfile_name) => {
+                            if cur_tempfile_name.is_some() {
+                                panic!("'TEMPFILE_CONTENTS {tempfile_name}' without 'TEMPFILE_END'");
+                            }
+                            cur_tempfile_name = Some(tempfile_name);
+                            cur_tempfile_lines.clear();
+                        }
+                        _ => {
+                            // Treat this line as zone file content.
+                            is_known_directive_with_value = false;
+                        }
+                    }
+
+                    if is_known_directive_with_value {
+                        continue;
+                    }
+                }
+
+                if line.starts_with("TEMPFILE_END") {
+                    let tempfile_lines = cur_tempfile_lines;
+                    cur_tempfile_lines = Vec::new();
+                    tempfiles
+                        .insert(cur_tempfile_name.unwrap(), tempfile_lines);
+                    cur_tempfile_name = None;
+                } else if line.trim().is_empty() {
+                    // Note: We don't actually ever reach this branch because
+                    // the Stelline config block parsing code discards empty
+                    // lines.
+                    cur_section = ConfigSection::None;
+                } else {
+                    cur_tempfile_lines.push(line);
+                }
+            }
+
+            ConfigSection::StubZone => {
+                eprintln!("Ignoring 'stub-zone': not implemented yet");
+            }
+
+            _ => {
+                // skip
             }
         }
     }
 
+    fn zonefile_str_from_tempfile(
+        tempfile_name: &str,
+        tempfiles: &HashMap<&str, Vec<&str>>,
+    ) -> String {
+        let mut zonefile_str = String::new();
+
+        let tempfile_lines = tempfiles
+            .get(tempfile_name)
+            .expect("TEMPFILE not found: '{tempfile_name}'");
+
+        for line in tempfile_lines {
+            if line.starts_with("$INCLUDE_TEMPFILE ") {
+                if let Some((_setting, value)) = line.trim().split_once(' ') {
+                    // Trim off whitespace and trailing comments.
+                    let include_tempfile_name = value
+                        .split_once('#')
+                        .map_or(value, |(value, _rest)| value)
+                        .trim();
+
+                    // Don't attempt a circular include
+                    if include_tempfile_name == tempfile_name {
+                        panic!(
+                            r#"Circular include: "$INCLUDE_TEMPFILE {include_tempfile_name}" from tempfile "{tempfile_name}""#
+                        );
+                    }
+
+                    if !tempfiles.contains_key(include_tempfile_name) {
+                        panic!(
+                            r#"TEMPFILE not found for "$INCLUDE_TEMPFILE {include_tempfile_name}"#
+                        );
+                    }
+
+                    let included_str = zonefile_str_from_tempfile(
+                        include_tempfile_name,
+                        tempfiles,
+                    );
+                    zonefile_str.push_str(&included_str);
+                }
+            } else {
+                zonefile_str.push_str(line);
+                zonefile_str.push('\n');
+            }
+        }
+
+        zonefile_str
+    }
+
+    // Process tempfiles
+    // Note: An earlier one can refer to a later one via $INCLUDE_TEMPFILE.
+    for tempfile_name in zone_tempfiles {
+        let zonefile_str =
+            zonefile_str_from_tempfile(tempfile_name, &tempfiles);
+        let mut reader = BufReader::new(zonefile_str.as_bytes());
+        let mut zonefile = Zonefile::load(&mut reader)
+            .expect("Error while parsing zone TEMPFILE '{tempfile_name}'");
+        zonefile.set_origin(Dname::bytes_from_str(tempfile_name).unwrap());
+        parsed_config.zonefiles.push(zonefile);
+    }
+
     if !zone_file_bytes.is_empty() {
-        parsed_config.zonefile =
-            Zonefile::load(&mut zone_file_bytes).unwrap();
+        let mut zonefile = Zonefile::load(&mut zone_file_bytes).unwrap();
+        zonefile.set_origin(Dname::bytes_from_str("test").unwrap());
+        parsed_config.zonefiles.push(zonefile);
     }
 
     parsed_config

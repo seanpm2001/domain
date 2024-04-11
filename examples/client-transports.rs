@@ -65,7 +65,10 @@ async fn main() {
     // terminate when all references to the connection have been dropped.
     // Make sure that the task does not accidentally get a reference to the
     // connection.
-    tokio::spawn(transport.run());
+    tokio::spawn(async move {
+        transport.run().await;
+        println!("UDP+TCP run exited");
+    });
 
     // Send a query message.
     let mut request = udptcp_conn.send_request(req.clone());
@@ -114,7 +117,10 @@ async fn main() {
 
     // Get a future for the run function. The run function receives
     // the connection stream as a parameter.
-    tokio::spawn(transport.run());
+    tokio::spawn(async move {
+        transport.run().await;
+        println!("multi TCP run exited");
+    });
 
     // Send a query message.
     let mut request = tcp_conn.send_request(req.clone());
@@ -166,7 +172,10 @@ async fn main() {
     );
 
     // Start the run function.
-    tokio::spawn(transport.run());
+    tokio::spawn(async move {
+        transport.run().await;
+        println!("TLS run exited");
+    });
 
     let mut request = tls_conn.send_request(req.clone());
     println!("Wating for TLS reply");
@@ -181,7 +190,10 @@ async fn main() {
 
     // Start the run function on a separate task.
     let run_fut = transp.run();
-    tokio::spawn(run_fut);
+    tokio::spawn(async move {
+        run_fut.await;
+        println!("redundant run terminated");
+    });
 
     // Add the previously created transports.
     redun.add(Box::new(udptcp_conn)).await.unwrap();
@@ -228,7 +240,10 @@ async fn main() {
     };
 
     let (tcp, transport) = stream::Connection::new(tcp_conn);
-    tokio::spawn(transport.run());
+    tokio::spawn(async move {
+        transport.run().await;
+        println!("single TCP run terminated");
+    });
 
     // Send a request message.
     let mut request = tcp.send_request(req);

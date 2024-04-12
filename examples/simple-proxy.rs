@@ -12,6 +12,7 @@ use domain::base::wire::Composer;
 use domain::base::{Message, MessageBuilder, ParsedDname, StreamTarget};
 use domain::dep::octseq::Octets;
 use domain::dep::octseq::OctetsBuilder;
+use domain::net::client::cache;
 use domain::net::client::dgram;
 use domain::net::client::dgram_stream;
 use domain::net::client::multi_stream;
@@ -65,8 +66,12 @@ struct Config {
 }
 
 /// Configure for client transports
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 enum TransportConfig {
+    /// Cached upstreams
+    #[serde(rename = "cache")]
+    Cache(CacheConfig),
+
     /// Redudant upstreams
     #[serde(rename = "redundant")]
     Redundant(RedundantConfig),
@@ -88,15 +93,22 @@ enum TransportConfig {
     UdpTcp(UdpTcpConfig),
 }
 
+/// Config for a cached transport
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CacheConfig {
+    /// upstream transport
+    upstream: Box<TransportConfig>,
+}
+
 /// Config for a redundant transport
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct RedundantConfig {
     /// List of transports to be used by a redundant transport
     transports: Vec<TransportConfig>,
 }
 
 /// Config for a TCP transport
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct TcpConfig {
     /// Address of the remote resolver
     addr: String,
@@ -106,7 +118,7 @@ struct TcpConfig {
 }
 
 /// Config for a TLS transport
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct TlsConfig {
     /// Name of the remote resolver
     servername: String,
@@ -119,7 +131,7 @@ struct TlsConfig {
 }
 
 /// Config for a UDP-only transport
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct UdpConfig {
     /// Address of the remote resolver
     addr: String,
@@ -129,7 +141,7 @@ struct UdpConfig {
 }
 
 /// Config for a UDP+TCP transport
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct UdpTcpConfig {
     /// Address of the remote resolver
     addr: String,
@@ -273,7 +285,8 @@ where
         ServiceError,
     >
     where
-        RequestOctets: AsRef<[u8]> + Clone + Debug + Octets + Send + Sync,
+        RequestOctets:
+            AsRef<[u8]> + Clone + Debug + Octets + Send + Sync + 'static,
         for<'a> &'a RequestOctets: AsRef<[u8]> + Debug,
         Target: AsMut<[u8]>
             + AsRef<[u8]>
@@ -287,23 +300,29 @@ where
             let msg: Message<RequestOctets> =
                 ctxmsg.message().as_ref().clone();
 
-            // Assume that the middleware layer will take care of setting the
-            // right ID in the reply.
+            // The middleware layer will take care of the ID in the reply.
 
+            // We get a Message, but the client transport needs a ComposeRequest
+            // (which is implemented by RequestMessage). Convert.
+
+            let do_bit = dnssec_ok(&msg);
             // We get a Message, but the client transport needs a
-            // ComposeRequest (which is implemented by RequestMessage).
-            // Convert.
+            // BaseMessageBuilder. Convert.
             println!("request {:?}", msg);
-            let request_msg = RequestMessage::new(msg);
+            let mut request_msg = RequestMessage::new(msg);
             println!("request {:?}", request_msg);
+            // Set the DO bit if it is set in the request.
+            if do_bit {
+                request_msg.set_dnssec_ok(true);
+            }
+
             let mut query = conn.send_request(request_msg);
             let reply = query.get_response().await.unwrap();
             println!("got reply {:?}", reply);
 
             // We get the reply as Message from the client transport but
-            // we need to return an AdditionalBuilder with a StreamTarget.
-            // Convert.
-            let stream = to_stream_additional::<_, Target>(&reply).unwrap();
+            // we need to return an AdditionalBuilder with a StreamTarget. Convert.
+            let stream = to_stream_additional::<_, _>(&reply).unwrap();
             Ok(CallResult::new(stream))
         }))
     }
@@ -340,9 +359,18 @@ where
 
         // We get a Message, but the client transport needs a ComposeRequest
         // (which is implemented by RequestMessage). Convert.
+
+        let do_bit = dnssec_ok(&msg);
+        // We get a Message, but the client transport needs a
+        // BaseMessageBuilder. Convert.
         println!("request {:?}", msg);
-        let request_msg = RequestMessage::new(msg);
+        let mut request_msg = RequestMessage::new(msg);
         println!("request {:?}", request_msg);
+        // Set the DO bit if it is set in the request.
+        if do_bit {
+            request_msg.set_dnssec_ok(true);
+        }
+
         let mut query = conn.send_request(request_msg);
         let reply = query.get_response().await.unwrap();
         println!("got reply {:?}", reply);
@@ -416,6 +444,56 @@ async fn main() {
     // We cannot use get_transport because we cannot pass a Box<dyn ...> to
     // query_service because it lacks Clone.
     let udp_join_handle = match conf.upstream {
+        TransportConfig::Cache(cache_conf) => {
+            // We cannot call get_transport here, because we need cache to
+            // match the type of upstream. Would an enum help here?
+            println!("cache_conf: {cache_conf:?}");
+            match &*cache_conf.upstream {
+                TransportConfig::Cache(_cache_conf) => {
+                    panic!("Nested caches are not possible");
+                }
+                TransportConfig::Tcp(tcp_conf) => {
+                    let upstream = get_tcp(tcp_conf.clone());
+                    let cache = get_cache::<RequestMessage<VecU8>, _>(
+                        cache_conf, upstream,
+                    )
+                    .await;
+                    start_service(cache, udpsocket2, buf_source)
+                }
+                TransportConfig::Tls(tls_conf) => {
+                    let upstream = get_tls(tls_conf.clone());
+                    let cache = get_cache::<RequestMessage<VecU8>, _>(
+                        cache_conf, upstream,
+                    )
+                    .await;
+                    start_service(cache, udpsocket2, buf_source)
+                }
+                TransportConfig::Redundant(redun_conf) => {
+                    let upstream = get_redun(redun_conf.clone()).await;
+                    let cache = get_cache::<RequestMessage<VecU8>, _>(
+                        cache_conf, upstream,
+                    )
+                    .await;
+                    start_service(cache, udpsocket2, buf_source)
+                }
+                TransportConfig::Udp(udp_conf) => {
+                    let upstream = get_udp(udp_conf.clone());
+                    let cache = get_cache::<RequestMessage<VecU8>, _>(
+                        cache_conf, upstream,
+                    )
+                    .await;
+                    start_service(cache, udpsocket2, buf_source)
+                }
+                TransportConfig::UdpTcp(udptcp_conf) => {
+                    let upstream = get_udptcp(udptcp_conf.clone());
+                    let cache = get_cache::<RequestMessage<VecU8>, _>(
+                        cache_conf, upstream,
+                    )
+                    .await;
+                    start_service(cache, udpsocket2, buf_source)
+                }
+            }
+        }
         TransportConfig::Redundant(redun_conf) => {
             let redun = get_redun::<RequestMessage<VecU8>>(redun_conf).await;
             start_service(redun, udpsocket2, buf_source)
@@ -439,6 +517,19 @@ async fn main() {
     };
 
     udp_join_handle.await.unwrap();
+}
+
+/// Get a cached transport based on its config
+async fn get_cache<CR, Upstream>(
+    _config: CacheConfig,
+    upstream: Upstream,
+) -> cache::Connection<Upstream>
+where
+    CR: Clone + Debug + ComposeRequest + 'static,
+{
+    println!("Create new cache");
+    let cache = cache::Connection::new(upstream);
+    cache
 }
 
 /// Get a redundant transport based on its config
@@ -525,7 +616,7 @@ fn get_udp<CR: ComposeRequest + Clone + 'static>(
 }
 
 /// Get a UDP+TCP transport based on its config
-fn get_udptcp<CR: ComposeRequest + Clone + 'static>(
+fn get_udptcp<CR: ComposeRequest + Clone + Debug + 'static>(
     config: UdpTcpConfig,
 ) -> impl SendRequest<CR> + Clone + Send + Sync {
     let sockaddr = get_sockaddr(&config.addr, config.port.as_deref(), 53);
@@ -550,6 +641,54 @@ fn get_transport<CR: ComposeRequest + Clone + 'static>(
     async move {
         println!("got config {:?}", config);
         let a: Box<dyn SendRequest<CR> + Send + Sync> = match config {
+            TransportConfig::Cache(cache_conf) => {
+                println!("cache_conf: {cache_conf:?}");
+                match &*cache_conf.upstream {
+                    TransportConfig::Cache(_) => {
+                        panic!("Nested caches are not possible");
+                    }
+                    TransportConfig::Redundant(redun_conf) => {
+                        let upstream = get_redun(redun_conf.clone()).await;
+                        let cache = get_cache::<RequestMessage<VecU8>, _>(
+                            cache_conf, upstream,
+                        )
+                        .await;
+                        Box::new(cache)
+                    }
+                    TransportConfig::Tcp(tcp_conf) => {
+                        let upstream = get_tcp(tcp_conf.clone());
+                        let cache = get_cache::<RequestMessage<VecU8>, _>(
+                            cache_conf, upstream,
+                        )
+                        .await;
+                        Box::new(cache)
+                    }
+                    TransportConfig::Tls(tls_conf) => {
+                        let upstream = get_tls(tls_conf.clone());
+                        let cache = get_cache::<RequestMessage<VecU8>, _>(
+                            cache_conf, upstream,
+                        )
+                        .await;
+                        Box::new(cache)
+                    }
+                    TransportConfig::Udp(udp_conf) => {
+                        let upstream = get_udp(udp_conf.clone());
+                        let cache = get_cache::<RequestMessage<VecU8>, _>(
+                            cache_conf, upstream,
+                        )
+                        .await;
+                        Box::new(cache)
+                    }
+                    TransportConfig::UdpTcp(udptcp_conf) => {
+                        let upstream = get_udptcp(udptcp_conf.clone());
+                        let cache = get_cache::<RequestMessage<VecU8>, _>(
+                            cache_conf, upstream,
+                        )
+                        .await;
+                        Box::new(cache)
+                    }
+                }
+            }
             TransportConfig::Redundant(redun_conf) => {
                 Box::new(get_redun(redun_conf).await)
             }
@@ -615,4 +754,12 @@ fn get_sockaddr(
     };
 
     SocketAddr::new(IpAddr::from_str(addr).unwrap(), port)
+}
+
+fn dnssec_ok<Octs: Octets>(msg: &Message<Octs>) -> bool {
+    if let Some(opt) = msg.opt() {
+        opt.dnssec_ok()
+    } else {
+        false
+    }
 }

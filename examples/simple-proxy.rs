@@ -3,6 +3,7 @@
 #![warn(missing_docs)]
 #![warn(clippy::missing_docs_in_private_items)]
 
+use crate::server::service::Transaction;
 use clap::Parser;
 use domain::base::iana::Rtype;
 use domain::base::message_builder::{AdditionalBuilder, PushError};
@@ -24,12 +25,8 @@ use domain::net::server::buf::BufSource;
 use domain::net::server::dgram::DgramServer;
 use domain::net::server::message::Request;
 use domain::net::server::middleware::builder::MiddlewareBuilder;
-use domain::net::server::prelude::{
-    service_fn, ServiceResultItem, Transaction,
-};
-use domain::net::server::service::{
-    CallResult, Service, ServiceError, ServiceResult,
-};
+use domain::net::server::service::{CallResult, Service, ServiceError};
+use domain::net::server::util::service_fn;
 use domain::rdata::AllRecordData;
 use futures_util::{future::BoxFuture, FutureExt};
 use rustls::ClientConfig;
@@ -189,7 +186,7 @@ where
     let mut target = target.additional();
     for rr in source {
         let rr = rr.unwrap();
-        if rr.rtype() == Rtype::Opt {
+        if rr.rtype() == Rtype::OPT {
             let rr = rr.into_record::<Opt<_>>().unwrap().unwrap();
             let opt_record = OptRecord::from_record(rr);
             target
@@ -266,12 +263,14 @@ where
 {
     /// Basic query function for Service.
     fn query<RequestOctets, Target>(
-        ctxmsg: Request<Message<RequestOctets>>,
+        ctxmsg: Request<RequestOctets>,
         conn: impl SendRequest<RequestMessage<RequestOctets>> + Send + Sync,
-    ) -> ServiceResult<
-        RequestOctets,
-        Target,
-        impl Future<Output = ServiceResultItem<RequestOctets, Target>> + Send,
+    ) -> Result<
+        Transaction<
+            Result<CallResult<Target>, ServiceError>,
+            impl Future<Output = Result<CallResult<Target>, ServiceError>> + Send,
+        >,
+        ServiceError,
     >
     where
         RequestOctets: AsRef<[u8]> + Clone + Debug + Octets + Send + Sync,
@@ -285,7 +284,8 @@ where
         Target::AppendError: Debug,
     {
         Ok(Transaction::single(async move {
-            let msg: Message<RequestOctets> = ctxmsg.message().clone();
+            let msg: Message<RequestOctets> =
+                ctxmsg.message().as_ref().clone();
 
             // Assume that the middleware layer will take care of setting the
             // right ID in the reply.
@@ -312,12 +312,14 @@ where
 }
 
 fn do_query<RequestOctets, Target, Metadata>(
-    ctxmsg: Request<Message<RequestOctets>>,
+    ctxmsg: Request<RequestOctets>,
     conn: Metadata,
-) -> ServiceResult<
-    RequestOctets,
-    Target,
-    impl Future<Output = ServiceResultItem<RequestOctets, Target>>,
+) -> Result<
+    Transaction<
+        Result<CallResult<Target>, ServiceError>,
+        impl Future<Output = Result<CallResult<Target>, ServiceError>> + Send,
+    >,
+    ServiceError,
 >
 where
     RequestOctets:
@@ -332,7 +334,7 @@ where
     Metadata: SendRequest<RequestMessage<RequestOctets>> + Send + 'static,
 {
     Ok(Transaction::single(Box::pin(async move {
-        let msg: Message<RequestOctets> = ctxmsg.message().clone();
+        let msg: Message<RequestOctets> = ctxmsg.message().as_ref().clone();
 
         // The middleware layer will take care of the ID in the reply.
 
@@ -368,10 +370,10 @@ impl BufSource for VecBufSource {
 }
 
 /// A single optional call result based on a Vector.
-struct VecSingle(Option<CallResult<Vec<u8>, ()>>);
+struct VecSingle(Option<CallResult<Vec<u8>>>);
 
 impl Future for VecSingle {
-    type Output = Result<CallResult<Vec<u8>, ()>, ServiceError>;
+    type Output = Result<CallResult<Vec<u8>>, ServiceError>;
 
     fn poll(
         mut self: Pin<&mut Self>,

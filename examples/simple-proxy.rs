@@ -44,6 +44,7 @@ use std::task::{Context, Poll};
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
+/// Select whether to use service_fn or not.
 const USE_MK_SERVICE: bool = true;
 
 /// Arguments parser.
@@ -330,6 +331,7 @@ where
     move |message| query::<RequestOctets, Target>(message, conn.clone())
 }
 
+/// Query function for service_fn.
 fn do_query<RequestOctets, Target, Metadata>(
     ctxmsg: Request<RequestOctets>,
     conn: Metadata,
@@ -454,42 +456,27 @@ async fn main() {
                 }
                 TransportConfig::Tcp(tcp_conf) => {
                     let upstream = get_tcp(tcp_conf.clone());
-                    let cache = get_cache::<RequestMessage<VecU8>, _>(
-                        cache_conf, upstream,
-                    )
-                    .await;
+                    let cache = get_cache(cache_conf, upstream).await;
                     start_service(cache, udpsocket2, buf_source)
                 }
                 TransportConfig::Tls(tls_conf) => {
                     let upstream = get_tls(tls_conf.clone());
-                    let cache = get_cache::<RequestMessage<VecU8>, _>(
-                        cache_conf, upstream,
-                    )
-                    .await;
+                    let cache = get_cache(cache_conf, upstream).await;
                     start_service(cache, udpsocket2, buf_source)
                 }
                 TransportConfig::Redundant(redun_conf) => {
                     let upstream = get_redun(redun_conf.clone()).await;
-                    let cache = get_cache::<RequestMessage<VecU8>, _>(
-                        cache_conf, upstream,
-                    )
-                    .await;
+                    let cache = get_cache(cache_conf, upstream).await;
                     start_service(cache, udpsocket2, buf_source)
                 }
                 TransportConfig::Udp(udp_conf) => {
                     let upstream = get_udp(udp_conf.clone());
-                    let cache = get_cache::<RequestMessage<VecU8>, _>(
-                        cache_conf, upstream,
-                    )
-                    .await;
+                    let cache = get_cache(cache_conf, upstream).await;
                     start_service(cache, udpsocket2, buf_source)
                 }
                 TransportConfig::UdpTcp(udptcp_conf) => {
                     let upstream = get_udptcp(udptcp_conf.clone());
-                    let cache = get_cache::<RequestMessage<VecU8>, _>(
-                        cache_conf, upstream,
-                    )
-                    .await;
+                    let cache = get_cache(cache_conf, upstream).await;
                     start_service(cache, udpsocket2, buf_source)
                 }
             }
@@ -520,16 +507,12 @@ async fn main() {
 }
 
 /// Get a cached transport based on its config
-async fn get_cache<CR, Upstream>(
+async fn get_cache<Upstream>(
     _config: CacheConfig,
     upstream: Upstream,
-) -> cache::Connection<Upstream>
-where
-    CR: Clone + Debug + ComposeRequest + 'static,
-{
+) -> cache::Connection<Upstream> {
     println!("Create new cache");
-    let cache = cache::Connection::new(upstream);
-    cache
+    cache::Connection::new(upstream)
 }
 
 /// Get a redundant transport based on its config
@@ -649,42 +632,27 @@ fn get_transport<CR: ComposeRequest + Clone + 'static>(
                     }
                     TransportConfig::Redundant(redun_conf) => {
                         let upstream = get_redun(redun_conf.clone()).await;
-                        let cache = get_cache::<RequestMessage<VecU8>, _>(
-                            cache_conf, upstream,
-                        )
-                        .await;
+                        let cache = get_cache(cache_conf, upstream).await;
                         Box::new(cache)
                     }
                     TransportConfig::Tcp(tcp_conf) => {
                         let upstream = get_tcp(tcp_conf.clone());
-                        let cache = get_cache::<RequestMessage<VecU8>, _>(
-                            cache_conf, upstream,
-                        )
-                        .await;
+                        let cache = get_cache(cache_conf, upstream).await;
                         Box::new(cache)
                     }
                     TransportConfig::Tls(tls_conf) => {
                         let upstream = get_tls(tls_conf.clone());
-                        let cache = get_cache::<RequestMessage<VecU8>, _>(
-                            cache_conf, upstream,
-                        )
-                        .await;
+                        let cache = get_cache(cache_conf, upstream).await;
                         Box::new(cache)
                     }
                     TransportConfig::Udp(udp_conf) => {
                         let upstream = get_udp(udp_conf.clone());
-                        let cache = get_cache::<RequestMessage<VecU8>, _>(
-                            cache_conf, upstream,
-                        )
-                        .await;
+                        let cache = get_cache(cache_conf, upstream).await;
                         Box::new(cache)
                     }
                     TransportConfig::UdpTcp(udptcp_conf) => {
                         let upstream = get_udptcp(udptcp_conf.clone());
-                        let cache = get_cache::<RequestMessage<VecU8>, _>(
-                            cache_conf, upstream,
-                        )
-                        .await;
+                        let cache = get_cache(cache_conf, upstream).await;
                         Box::new(cache)
                     }
                 }
@@ -756,6 +724,7 @@ fn get_sockaddr(
     SocketAddr::new(IpAddr::from_str(addr).unwrap(), port)
 }
 
+/// Return whether the DO flag is set.
 fn dnssec_ok<Octs: Octets>(msg: &Message<Octs>) -> bool {
     if let Some(opt) = msg.opt() {
         opt.dnssec_ok()

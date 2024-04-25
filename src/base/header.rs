@@ -17,7 +17,6 @@
 
 use super::iana::{Opcode, Rcode};
 use super::wire::ParseError;
-use core::convert::TryInto;
 use core::{fmt, mem, str::FromStr};
 use octseq::builder::OctetsBuilder;
 use octseq::parse::Parser;
@@ -72,8 +71,8 @@ impl Header {
     /// Creates a new header.
     ///
     /// The new header has all fields as either zero or false. Thus, the
-    /// opcode will be [`Opcode::Query`] and the response code will be
-    /// [`Rcode::NoError`].
+    /// opcode will be [`Opcode::QUERY`] and the response code will be
+    /// [`Rcode::NOERROR`].
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -156,7 +155,7 @@ impl Header {
     ///
     /// This field specifies the kind of query a message contains. See
     /// the [`Opcode`] type for more information on the possible values and
-    /// their meaning. Normal queries have the variant [`Opcode::Query`]
+    /// their meaning. Normal queries have the variant [`Opcode::QUERY`]
     /// which is also the default value when creating a new header.
     #[must_use]
     pub fn opcode(self) -> Opcode {
@@ -286,7 +285,7 @@ impl Header {
     /// [`Rcode`]: ../../iana/rcode/enum.Rcode.html
     #[must_use]
     pub fn rcode(self) -> Rcode {
-        Rcode::from_int(self.inner[3] & 0x0F)
+        Rcode::masked_from_int(self.inner[3])
     }
 
     /// Sets the value of the RCODE field.
@@ -440,7 +439,7 @@ impl FromStr for Flags {
                 "AD" | "Ad" | "aD" | "ad" => flags.ad = true,
                 "CD" | "Cd" | "cD" | "cd" => flags.cd = true,
                 "" => {}
-                _ => return Err(FlagsFromStrError),
+                _ => return Err(FlagsFromStrError(())),
             }
         }
         Ok(flags)
@@ -589,7 +588,7 @@ impl HeaderCounts {
                 self.set_qdcount(count);
                 Ok(())
             }
-            None => Err(CountOverflow),
+            None => Err(CountOverflow(())),
         }
     }
 
@@ -628,7 +627,7 @@ impl HeaderCounts {
                 self.set_ancount(count);
                 Ok(())
             }
-            None => Err(CountOverflow),
+            None => Err(CountOverflow(())),
         }
     }
 
@@ -667,7 +666,7 @@ impl HeaderCounts {
                 self.set_nscount(count);
                 Ok(())
             }
-            None => Err(CountOverflow),
+            None => Err(CountOverflow(())),
         }
     }
 
@@ -706,7 +705,7 @@ impl HeaderCounts {
                 self.set_arcount(count);
                 Ok(())
             }
-            None => Err(CountOverflow),
+            None => Err(CountOverflow(())),
         }
     }
 
@@ -926,7 +925,7 @@ impl AsMut<HeaderCounts> for HeaderSection {
 
 /// An error happened when converting string to flags.
 #[derive(Debug)]
-pub struct FlagsFromStrError;
+pub struct FlagsFromStrError(());
 
 impl fmt::Display for FlagsFromStrError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -941,7 +940,7 @@ impl std::error::Error for FlagsFromStrError {}
 
 /// An error happened while increasing a header count.
 #[derive(Debug)]
-pub struct CountOverflow;
+pub struct CountOverflow(());
 
 impl fmt::Display for CountOverflow {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -957,7 +956,6 @@ impl std::error::Error for CountOverflow {}
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::base::iana::{Opcode, Rcode};
 
     #[test]
     #[cfg(feature = "std")]
@@ -1026,7 +1024,7 @@ mod test {
     fn header() {
         test_field!(id, set_id, 0, 0x1234);
         test_field!(qr, set_qr, false, true, false);
-        test_field!(opcode, set_opcode, Opcode::Query, Opcode::Notify);
+        test_field!(opcode, set_opcode, Opcode::QUERY, Opcode::NOTIFY);
         test_field!(
             flags,
             set_flags,
@@ -1043,7 +1041,7 @@ mod test {
         test_field!(z, set_z, false, true, false);
         test_field!(ad, set_ad, false, true, false);
         test_field!(cd, set_cd, false, true, false);
-        test_field!(rcode, set_rcode, Rcode::NoError, Rcode::Refused);
+        test_field!(rcode, set_rcode, Rcode::NOERROR, Rcode::REFUSED);
     }
 
     #[test]

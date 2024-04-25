@@ -12,31 +12,27 @@ macro_rules! int_enum {
       $( $(#[$variant_attr:meta])* ( $variant:ident =>
                                         $value:expr, $mnemonic:expr) )* ) => {
         $(#[$attr])*
-        #[derive(Clone, Copy, Debug)]
-        pub enum $ianatype {
-            $( $(#[$variant_attr])* $variant ),*,
+        #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $ianatype($inttype);
 
-            /// A raw value given through its integer.
-            Int($inttype)
+        impl $ianatype {
+            $(
+                $(#[$variant_attr])*
+                pub const $variant: $ianatype = $ianatype($value);
+            )*
         }
 
         impl $ianatype {
             /// Returns a value from its raw integer value.
             #[must_use]
             pub const fn from_int(value: $inttype) -> Self {
-                match value {
-                    $( $value => $ianatype::$variant ),*,
-                    _ => $ianatype::Int(value)
-                }
+                Self(value)
             }
 
             /// Returns the raw integer value for a value.
             #[must_use]
             pub const fn to_int(self) -> $inttype {
-                match self {
-                    $( $ianatype::$variant => $value ),*,
-                    $ianatype::Int(value) => value
-                }
+                self.0
             }
 
             /// Returns a value from a well-defined mnemonic.
@@ -57,13 +53,12 @@ macro_rules! int_enum {
             #[must_use]
             pub const fn to_mnemonic(self) -> Option<&'static [u8]> {
                 match self {
-                    $( $ianatype::$variant => Some($mnemonic) ),*,
-                    $ianatype::Int(value) => {
-                        match $ianatype::from_int(value) {
-                            $ianatype::Int(_) => None,
-                            value => value.to_mnemonic()
+                    $(
+                        $ianatype::$variant => {
+                            Some($mnemonic)
                         }
-                    }
+                    )*
+                    _ => None
                 }
             }
 
@@ -107,68 +102,26 @@ macro_rules! int_enum {
             }
         }
 
+        //--- Debug
 
-        //--- PartialEq and Eq
-
-        impl PartialEq for $ianatype {
-            fn eq(&self, other: &Self) -> bool {
-                self.to_int() == other.to_int()
-            }
-        }
-
-        impl PartialEq<$inttype> for $ianatype {
-            fn eq(&self, other: &$inttype) -> bool {
-                self.to_int() == *other
-            }
-        }
-
-        impl PartialEq<$ianatype> for $inttype {
-            fn eq(&self, other: &$ianatype) -> bool {
-                *self == other.to_int()
-            }
-        }
-
-        impl Eq for $ianatype { }
-
-
-        //--- PartialOrd and Ord
-
-        impl PartialOrd for $ianatype {
-            fn partial_cmp(
-                &self, other: &Self
-            ) -> Option<core::cmp::Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-
-        impl PartialOrd<$inttype> for $ianatype {
-            fn partial_cmp(
-                &self, other: &$inttype
-                ) -> Option<core::cmp::Ordering> {
-                self.to_int().partial_cmp(other)
-            }
-        }
-
-        impl PartialOrd<$ianatype> for $inttype {
-            fn partial_cmp(
-                &self, other: &$ianatype
-            ) -> Option<core::cmp::Ordering> {
-                self.partial_cmp(&other.to_int())
-            }
-        }
-
-        impl Ord for $ianatype {
-            fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-                self.to_int().cmp(&other.to_int())
-            }
-        }
-
-
-        //--- Hash
-
-        impl core::hash::Hash for $ianatype {
-            fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-                self.to_int().hash(state)
+        impl core::fmt::Debug for $ianatype {
+            fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+                match self.to_mnemonic().and_then(|bytes| {
+                    core::str::from_utf8(bytes).ok()
+                }) {
+                    Some(mnemonic) => {
+                        write!(
+                            f,
+                            concat!(stringify!($ianatype), "::{}"),
+                            mnemonic
+                        )
+                    }
+                    None => {
+                        f.debug_tuple(stringify!($ianatype))
+                            .field(&self.0)
+                            .finish()
+                    }
+                }
             }
         }
     }
@@ -311,7 +264,7 @@ macro_rules! int_enum_str_with_decimal {
                         if let Ok(res) = s.parse() {
                             Ok($ianatype::from_int(res))
                         } else {
-                            Err(FromStrError)
+                            Err(FromStrError(()))
                         }
                     }
                 }
@@ -420,14 +373,14 @@ macro_rules! int_enum_str_with_prefix {
                             if l.eq_ignore_ascii_case($str_prefix) {
                                 let value = match r.parse() {
                                     Ok(x) => x,
-                                    Err(..) => return Err(FromStrError),
+                                    Err(..) => return Err(FromStrError(())),
                                 };
                                 Ok($ianatype::from_int(value))
                             } else {
-                                Err(FromStrError)
+                                Err(FromStrError(()))
                             }
                         } else {
-                            Err(FromStrError)
+                            Err(FromStrError(()))
                         }
                     }
                 }
@@ -505,7 +458,7 @@ macro_rules! scan_impl {
 macro_rules! from_str_error {
     ($description:expr) => {
         #[derive(Clone, Debug)]
-        pub struct FromStrError;
+        pub struct FromStrError(());
 
         #[cfg(feature = "std")]
         impl std::error::Error for FromStrError {

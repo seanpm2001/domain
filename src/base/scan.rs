@@ -22,7 +22,7 @@
 #![allow(unused_imports)] // XXX
 
 use crate::base::charstr::{CharStr, CharStrBuilder};
-use crate::base::name::{Dname, ToDname};
+use crate::base::name::{Name, ToName};
 use crate::base::wire::{Compose, Composer};
 use core::convert::{TryFrom, TryInto};
 use core::iter::Peekable;
@@ -153,7 +153,7 @@ pub trait Scanner {
         + FreezeBuilder<Octets = Self::Octets>;
 
     /// The type of a domain name returned by the scanner.
-    type Dname: ToDname;
+    type Name: ToName;
 
     /// The error type of the scanner.
     type Error: ScannerError;
@@ -220,7 +220,7 @@ pub trait Scanner {
         F: FnOnce(&str) -> Result<T, Self::Error>;
 
     /// Scans a token into a domain name.
-    fn scan_dname(&mut self) -> Result<Self::Dname, Self::Error>;
+    fn scan_name(&mut self) -> Result<Self::Name, Self::Error>;
 
     /// Scans a token into a character string.
     ///
@@ -588,6 +588,36 @@ impl Symbol {
         }
     }
 
+    /// Provides the best symbol for an octet inside a quoted string.
+    ///
+    /// The function will only escape a double quote and backslash using a
+    /// simple escape and all non-printable characters using decimal escapes.
+    #[must_use]
+    pub fn quoted_from_octet(ch: u8) -> Self {
+        if ch == b'"' || ch == b'\\' {
+            Symbol::SimpleEscape(ch)
+        } else if !(0x20..0x7F).contains(&ch) {
+            Symbol::DecimalEscape(ch)
+        } else {
+            Symbol::Char(ch as char)
+        }
+    }
+
+    /// Provides the best symbol for an octet inside a `Display` impl.
+    ///
+    /// The function will only escape a backslash using a simple escape and
+    /// all non-printable characters using decimal escapes.
+    #[must_use]
+    pub fn display_from_octet(ch: u8) -> Self {
+        if ch == b'\\' {
+            Symbol::SimpleEscape(ch)
+        } else if !(0x20..0x7F).contains(&ch) {
+            Symbol::DecimalEscape(ch)
+        } else {
+            Symbol::Char(ch as char)
+        }
+    }
+
     /// Converts the symbol into an octet if it represents one.
     ///
     /// Both domain names and character strings operate on bytes instead of
@@ -673,6 +703,7 @@ impl Symbol {
             Symbol::Char(ch) => {
                 ch != ' '
                     && ch != '\t'
+                    && ch != '\r'
                     && ch != '\n'
                     && ch != '('
                     && ch != ')'
@@ -698,7 +729,7 @@ impl fmt::Display for Symbol {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Symbol::Char(ch) => write!(f, "{}", ch),
-            Symbol::SimpleEscape(ch) => write!(f, "\\{}", ch),
+            Symbol::SimpleEscape(ch) => write!(f, "\\{}", ch as char),
             Symbol::DecimalEscape(ch) => write!(f, "\\{:03}", ch),
         }
     }
@@ -820,7 +851,7 @@ where
 {
     type Octets = Octets;
     type OctetsBuilder = <Octets as FromBuilder>::Builder;
-    type Dname = Dname<Octets>;
+    type Name = Name<Octets>;
     type Error = StrError;
 
     fn has_space(&self) -> bool {
@@ -926,12 +957,12 @@ where
         }
     }
 
-    fn scan_dname(&mut self) -> Result<Self::Dname, Self::Error> {
+    fn scan_name(&mut self) -> Result<Self::Name, Self::Error> {
         let token = match self.iter.next() {
             Some(token) => token,
             None => return Err(StrError::end_of_entry()),
         };
-        Dname::from_symbols(Symbols::new(token.as_ref().chars()))
+        Name::from_symbols(Symbols::new(token.as_ref().chars()))
             .map_err(|_| StrError::custom("invalid domain name"))
     }
 
@@ -997,10 +1028,10 @@ where
 
 /// An error happened when reading a symbol.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SymbolCharsError(pub(super) SymbolCharsEnum);
+pub struct SymbolCharsError(SymbolCharsEnum);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum SymbolCharsEnum {
+enum SymbolCharsEnum {
     /// An illegal escape sequence was encountered.
     BadEscape,
 
@@ -1011,11 +1042,21 @@ pub(super) enum SymbolCharsEnum {
 }
 
 impl SymbolCharsError {
+    /// Creates a “bad escape” variant of the error.
+    pub(crate) const fn bad_escape() -> Self {
+        Self(SymbolCharsEnum::BadEscape)
+    }
+
+    /// Creates a “short input” variant of the error.
+    pub(crate) const fn short_input() -> Self {
+        Self(SymbolCharsEnum::ShortInput)
+    }
+
     /// Returns a static description of the error.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self.0 {
-            SymbolCharsEnum::BadEscape => "illegale escape sequence",
+            SymbolCharsEnum::BadEscape => "illegal escape sequence",
             SymbolCharsEnum::ShortInput => "unexpected end of input",
         }
     }
@@ -1096,6 +1137,10 @@ enum BadSymbolEnum {
 }
 
 impl BadSymbol {
+    pub(crate) fn non_ascii() -> Self {
+        Self(BadSymbolEnum::NonAscii)
+    }
+
     /// Returns a static description of the error.
     #[must_use]
     pub fn as_str(self) -> &'static str {

@@ -4,13 +4,13 @@
 #![warn(clippy::missing_docs_in_private_items)]
 
 use crate::base::iana::Rcode;
-use crate::base::message::CopyRecordsError;
+use crate::base::message::{CopyRecordsError, ShortMessage};
 use crate::base::message_builder::{
     AdditionalBuilder, MessageBuilder, PushError, StaticCompressor,
 };
 use crate::base::opt::{ComposeOptData, LongOptData, OptRecord};
-use crate::base::wire::Composer;
-use crate::base::{Header, Message, ParsedDname, Rtype};
+use crate::base::wire::{Composer, ParseError};
+use crate::base::{Header, Message, ParsedName, Rtype};
 use crate::rdata::AllRecordData;
 use bytes::Bytes;
 use octseq::Octets;
@@ -21,6 +21,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::vec::Vec;
 use std::{error, fmt};
+use tracing::trace;
 
 //------------ ComposeRequest ------------------------------------------------
 
@@ -33,17 +34,20 @@ pub trait ComposeRequest: Debug + Send + Sync {
     ) -> Result<(), CopyRecordsError>;
 
     /// Create a message that captures the recorded changes.
-    fn to_message(&self) -> Message<Vec<u8>>;
+    fn to_message(&self) -> Result<Message<Vec<u8>>, Error>;
 
     /// Create a message that captures the recorded changes and convert to
     /// a Vec.
-    fn to_vec(&self) -> Vec<u8>;
+    fn to_vec(&self) -> Result<Vec<u8>, Error>;
 
     /// Return a reference to a mutable Header to record changes to the header.
     fn header_mut(&mut self) -> &mut Header;
 
     /// Set the UDP payload size.
     fn set_udp_payload_size(&mut self, value: u16);
+
+    /// Set the DNSSEC OK flag.
+    fn set_dnssec_ok(&mut self, value: bool);
 
     /// Add an EDNS option.
     fn add_opt(
@@ -63,7 +67,10 @@ pub trait ComposeRequest: Debug + Send + Sync {
 /// However, the use of 'dyn Request' in redundant currently prevents that.
 pub trait SendRequest<CR> {
     /// Request function that takes a ComposeRequest type.
-    fn send_request(&self, request_msg: CR) -> Box<dyn GetResponse + Send>;
+    fn send_request(
+        &self,
+        request_msg: CR,
+    ) -> Box<dyn GetResponse + Send + Sync>;
 }
 
 //------------ GetResponse ---------------------------------------------------
@@ -79,7 +86,12 @@ pub trait GetResponse: Debug {
     fn get_response(
         &mut self,
     ) -> Pin<
-        Box<dyn Future<Output = Result<Message<Bytes>, Error>> + Send + '_>,
+        Box<
+            dyn Future<Output = Result<Message<Bytes>, Error>>
+                + Send
+                + Sync
+                + '_,
+        >,
     >;
 }
 
@@ -135,7 +147,7 @@ impl<Octs: AsRef<[u8]> + Debug + Octets> RequestMessage<Octs> {
         let mut target = target.answer();
         for rr in &mut source {
             let rr = rr?
-                .into_record::<AllRecordData<_, ParsedDname<_>>>()?
+                .into_record::<AllRecordData<_, ParsedName<_>>>()?
                 .expect("record expected");
             target.push(rr)?;
         }
@@ -145,7 +157,7 @@ impl<Octs: AsRef<[u8]> + Debug + Octets> RequestMessage<Octs> {
         let mut target = target.authority();
         for rr in &mut source {
             let rr = rr?
-                .into_record::<AllRecordData<_, ParsedDname<_>>>()?
+                .into_record::<AllRecordData<_, ParsedName<_>>>()?
                 .expect("record expected");
             target.push(rr)?;
         }
@@ -155,9 +167,9 @@ impl<Octs: AsRef<[u8]> + Debug + Octets> RequestMessage<Octs> {
         let mut target = target.additional();
         for rr in source {
             let rr = rr?;
-            if rr.rtype() != Rtype::Opt {
+            if rr.rtype() != Rtype::OPT {
                 let rr = rr
-                    .into_record::<AllRecordData<_, ParsedDname<_>>>()?
+                    .into_record::<AllRecordData<_, ParsedName<_>>>()?
                     .expect("record expected");
                 target.push(rr)?;
             }
@@ -202,13 +214,13 @@ impl<Octs: AsRef<[u8]> + Clone + Debug + Octets + Send + Sync + 'static>
         Ok(())
     }
 
-    fn to_vec(&self) -> Vec<u8> {
-        let msg = self.to_message();
-        msg.as_octets().clone()
+    fn to_vec(&self) -> Result<Vec<u8>, Error> {
+        let msg = self.to_message()?;
+        Ok(msg.as_octets().clone())
     }
 
-    fn to_message(&self) -> Message<Vec<u8>> {
-        self.to_message_impl().unwrap()
+    fn to_message(&self) -> Result<Message<Vec<u8>>, Error> {
+        self.to_message_impl()
     }
 
     fn header_mut(&mut self) -> &mut Header {
@@ -217,6 +229,10 @@ impl<Octs: AsRef<[u8]> + Clone + Debug + Octets + Send + Sync + 'static>
 
     fn set_udp_payload_size(&mut self, value: u16) {
         self.opt_mut().set_udp_payload_size(value);
+    }
+
+    fn set_dnssec_ok(&mut self, value: bool) {
+        self.opt_mut().set_dnssec_ok(value);
     }
 
     fn add_opt(
@@ -232,12 +248,18 @@ impl<Octs: AsRef<[u8]> + Clone + Debug + Octets + Send + Sync + 'static>
 
         // First check qr is set and IDs match.
         if !answer_header.qr() || answer_header.id() != self.header.id() {
+            trace!(
+                "Wrong QR or ID: QR={}, answer ID={}, self ID={}",
+                answer_header.qr(),
+                answer_header.id(),
+                self.header.id()
+            );
             return false;
         }
 
         // If the result is an error, then the question section can be empty.
         // In that case we require all other sections to be empty as well.
-        if answer_header.rcode() != Rcode::NoError
+        if answer_header.rcode() != Rcode::NOERROR
             && answer_hcounts.qdcount() == 0
             && answer_hcounts.ancount() == 0
             && answer_hcounts.nscount() == 0
@@ -250,9 +272,14 @@ impl<Octs: AsRef<[u8]> + Clone + Debug + Octets + Send + Sync + 'static>
         // Now the question section in the reply has to be the same as in the
         // query.
         if answer_hcounts.qdcount() != self.msg.header_counts().qdcount() {
+            trace!("Wrong QD count");
             false
         } else {
-            answer.question() == self.msg.for_slice().question()
+            let res = answer.question() == self.msg.for_slice().question();
+            if !res {
+                trace!("Wrong question");
+            }
+            res
         }
     }
 }
@@ -318,6 +345,18 @@ pub enum Error {
 impl From<LongOptData> for Error {
     fn from(_: LongOptData) -> Self {
         Self::OptTooLong
+    }
+}
+
+impl From<ParseError> for Error {
+    fn from(_: ParseError) -> Self {
+        Self::MessageParseError
+    }
+}
+
+impl From<ShortMessage> for Error {
+    fn from(_: ShortMessage) -> Self {
+        Self::ShortMessage
     }
 }
 

@@ -32,6 +32,9 @@ use octseq::parse::Parser;
 pub struct Expire(Option<u32>);
 
 impl Expire {
+    /// The option code for this option.
+    pub(super) const CODE: OptionCode = OptionCode::EXPIRE;
+    
     /// Creates a new expire option with the given optional expire value.
     #[must_use]
     pub fn new(expire: Option<u32>) -> Self {
@@ -56,7 +59,10 @@ impl Expire {
         }
     }
 
-    pub(crate) fn try_octets_from<E>(src: Self) -> Result<Self, E> {
+    /// Placeholder for unnecessary octets conversion.
+    ///
+    /// This method only exists for the `AllOptData` macro.
+    pub(super) fn try_octets_from<E>(src: Self) -> Result<Self, E> {
         Ok(src)
     }
 }
@@ -65,7 +71,7 @@ impl Expire {
 
 impl OptData for Expire {
     fn code(&self) -> OptionCode {
-        OptionCode::Expire
+        OptionCode::EXPIRE
     }
 }
 
@@ -74,7 +80,7 @@ impl<'a, Octs: AsRef<[u8]>> ParseOptData<'a, Octs> for Expire {
         code: OptionCode,
         parser: &mut Parser<'a, Octs>,
     ) -> Result<Option<Self>, ParseError> {
-        if code == OptionCode::Expire {
+        if code == OptionCode::EXPIRE {
             Self::parse(parser).map(Some)
         }
         else {

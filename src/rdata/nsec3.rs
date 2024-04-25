@@ -52,6 +52,11 @@ pub struct Nsec3<Octs> {
     types: RtypeBitmap<Octs>,
 }
 
+impl Nsec3<()> {
+    /// The rtype of this record data type.
+    pub(crate) const RTYPE: Rtype = Rtype::NSEC3;
+}
+
 impl<Octs> Nsec3<Octs> {
     pub fn new(
         hash_algorithm: Nsec3HashAlg,
@@ -280,7 +285,7 @@ impl<Octs: AsRef<[u8]>> hash::Hash for Nsec3<Octs> {
 
 impl<Octs> RecordData for Nsec3<Octs> {
     fn rtype(&self) -> Rtype {
-        Rtype::Nsec3
+        Nsec3::RTYPE
     }
 }
 
@@ -292,7 +297,7 @@ where
         rtype: Rtype,
         parser: &mut Parser<'a, Octs>,
     ) -> Result<Option<Self>, ParseError> {
-        if rtype == Rtype::Nsec3 {
+        if rtype == Nsec3::RTYPE {
             Self::parse(parser).map(Some)
         } else {
             Ok(None)
@@ -385,6 +390,11 @@ pub struct Nsec3param<Octs> {
     flags: u8,
     iterations: u16,
     salt: Nsec3Salt<Octs>,
+}
+
+impl Nsec3param<()> {
+    /// The rtype of this record data type.
+    pub(crate) const RTYPE: Rtype = Rtype::NSEC3PARAM;
 }
 
 impl<Octs> Nsec3param<Octs> {
@@ -577,7 +587,7 @@ impl<Octs: AsRef<[u8]>> hash::Hash for Nsec3param<Octs> {
 
 impl<Octs> RecordData for Nsec3param<Octs> {
     fn rtype(&self) -> Rtype {
-        Rtype::Nsec3param
+        Nsec3param::RTYPE
     }
 }
 
@@ -589,7 +599,7 @@ where
         rtype: Rtype,
         parser: &mut Parser<'a, Octs>,
     ) -> Result<Option<Self>, ParseError> {
-        if rtype == Rtype::Nsec3param {
+        if rtype == Nsec3param::RTYPE {
             Self::parse(parser).map(Some)
         } else {
             Ok(None)
@@ -688,7 +698,7 @@ impl<Octs: ?Sized> Nsec3Salt<Octs> {
         Octs: AsRef<[u8]> + Sized,
     {
         if octets.as_ref().len() > Nsec3Salt::MAX_LEN {
-            Err(Nsec3SaltError)
+            Err(Nsec3SaltError(()))
         } else {
             Ok(unsafe { Self::from_octets_unchecked(octets) })
         }
@@ -759,7 +769,7 @@ impl Nsec3Salt<[u8]> {
     /// Creates a new salt value from an octet slice.
     pub fn from_slice(slice: &[u8]) -> Result<&Self, Nsec3SaltError> {
         if slice.len() > Nsec3Salt::MAX_LEN {
-            Err(Nsec3SaltError)
+            Err(Nsec3SaltError(()))
         } else {
             Ok(unsafe { &*(slice as *const [u8] as *const Nsec3Salt<[u8]>) })
         }
@@ -1089,7 +1099,7 @@ impl<Octs> OwnerHash<Octs> {
         Octs: AsRef<[u8]>,
     {
         if octets.as_ref().len() > OwnerHash::MAX_LEN {
-            Err(OwnerHashError)
+            Err(OwnerHashError(()))
         } else {
             Ok(unsafe { Self::from_octets_unchecked(octets) })
         }
@@ -1167,7 +1177,7 @@ impl OwnerHash<[u8]> {
     /// Creates a new owner hash from an octet slice.
     pub fn from_slice(slice: &[u8]) -> Result<&Self, OwnerHashError> {
         if slice.len() > OwnerHash::MAX_LEN {
-            Err(OwnerHashError)
+            Err(OwnerHashError(()))
         } else {
             Ok(unsafe { &*(slice as *const [u8] as *const OwnerHash<[u8]>) })
         }
@@ -1411,7 +1421,7 @@ where
 ///
 /// This can only mean that the sequence is longer than 255 bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Nsec3SaltError;
+pub struct Nsec3SaltError(());
 
 impl fmt::Display for Nsec3SaltError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -1428,7 +1438,7 @@ impl std::error::Error for Nsec3SaltError {}
 ///
 /// This can only mean that the sequence is longer than 255 bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct OwnerHashError;
+pub struct OwnerHashError(());
 
 impl fmt::Display for OwnerHashError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -1456,9 +1466,9 @@ mod test {
     fn nsec3_compose_parse_scan() {
         let mut rtype = RtypeBitmapBuilder::new_vec();
         rtype.add(Rtype::A).unwrap();
-        rtype.add(Rtype::Srv).unwrap();
+        rtype.add(Rtype::SRV).unwrap();
         let rdata = Nsec3::new(
-            Nsec3HashAlg::Sha1,
+            Nsec3HashAlg::SHA1,
             10,
             11,
             Nsec3Salt::from_octets(Vec::from("bar")).unwrap(),
@@ -1478,7 +1488,7 @@ mod test {
     #[allow(clippy::redundant_closure)] // lifetimes ...
     fn nsec3param_compose_parse_scan() {
         let rdata = Nsec3param::new(
-            Nsec3HashAlg::Sha1,
+            Nsec3HashAlg::SHA1,
             10,
             11,
             Nsec3Salt::from_octets(Vec::from("bar")).unwrap(),

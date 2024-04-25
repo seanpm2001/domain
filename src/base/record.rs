@@ -17,7 +17,7 @@
 
 use super::cmp::CanonicalOrd;
 use super::iana::{Class, Rtype};
-use super::name::{FlattenInto, ParsedDname, ToDname};
+use super::name::{FlattenInto, ParsedName, ToName};
 use super::opt::OptRecord;
 use super::rdata::{
     ComposeRecordData, ParseAnyRecordData, ParseRecordData, RecordData,
@@ -211,7 +211,7 @@ impl<OName: ToDname, DOcts, DName>
 
 /// Parsing and Composing
 ///
-impl<Octs, Data> Record<ParsedDname<Octs>, Data> {
+impl<Octs, Data> Record<ParsedName<Octs>, Data> {
     pub fn parse<'a, Src: Octets<Range<'a> = Octs> + 'a>(
         parser: &mut Parser<'a, Src>,
     ) -> Result<Option<Self>, ParseError>
@@ -223,12 +223,12 @@ impl<Octs, Data> Record<ParsedDname<Octs>, Data> {
     }
 }
 
-impl<N: ToDname, D: RecordData + ComposeRecordData> Record<N, D> {
+impl<N: ToName, D: RecordData + ComposeRecordData> Record<N, D> {
     pub fn compose<Target: Composer + ?Sized>(
         &self,
         target: &mut Target,
     ) -> Result<(), Target::AppendError> {
-        target.append_compressed_dname(&self.owner)?;
+        target.append_compressed_name(&self.owner)?;
         self.data.rtype().compose(target)?;
         self.class.compose(target)?;
         self.ttl.compose(target)?;
@@ -263,7 +263,15 @@ impl<N, D> From<(N, Class, Ttl, D)> for Record<N, D> {
 
 impl<N, D> From<(N, u32, D)> for Record<N, D> {
     fn from((owner, ttl, data): (N, u32, D)) -> Self {
-        Self::new(owner, Class::In, Ttl::from_secs(ttl), data)
+        Self::new(owner, Class::IN, Ttl::from_secs(ttl), data)
+    }
+}
+
+//--- AsRef
+
+impl<N, D> AsRef<Record<N, D>> for Record<N, D> {
+    fn as_ref(&self) -> &Record<N, D> {
+        self
     }
 }
 
@@ -371,8 +379,8 @@ where
 
 impl<N, NN, D, DD> CanonicalOrd<Record<NN, DD>> for Record<N, D>
 where
-    N: ToDname,
-    NN: ToDname,
+    N: ToName,
+    NN: ToName,
     D: RecordData + CanonicalOrd<DD>,
     DD: RecordData,
 {
@@ -480,7 +488,7 @@ impl<'a, T: ComposeRecord> ComposeRecord for &'a T {
 
 impl<Name, Data> ComposeRecord for Record<Name, Data>
 where
-    Name: ToDname,
+    Name: ToName,
     Data: ComposeRecordData,
 {
     fn compose_record<Target: Composer + ?Sized>(
@@ -493,7 +501,7 @@ where
 
 impl<Name, Data> ComposeRecord for (Name, Class, u32, Data)
 where
-    Name: ToDname,
+    Name: ToName,
     Data: ComposeRecordData,
 {
     fn compose_record<Target: Composer + ?Sized>(
@@ -507,7 +515,7 @@ where
 
 impl<Name, Data> ComposeRecord for (Name, Class, Ttl, Data)
 where
-    Name: ToDname,
+    Name: ToName,
     Data: ComposeRecordData,
 {
     fn compose_record<Target: Composer + ?Sized>(
@@ -520,28 +528,28 @@ where
 
 impl<Name, Data> ComposeRecord for (Name, u32, Data)
 where
-    Name: ToDname,
+    Name: ToName,
     Data: ComposeRecordData,
 {
     fn compose_record<Target: Composer + ?Sized>(
         &self,
         target: &mut Target,
     ) -> Result<(), Target::AppendError> {
-        Record::new(&self.0, Class::In, Ttl::from_secs(self.1), &self.2)
+        Record::new(&self.0, Class::IN, Ttl::from_secs(self.1), &self.2)
             .compose(target)
     }
 }
 
 impl<Name, Data> ComposeRecord for (Name, Ttl, Data)
 where
-    Name: ToDname,
+    Name: ToName,
     Data: ComposeRecordData,
 {
     fn compose_record<Target: Composer + ?Sized>(
         &self,
         target: &mut Target,
     ) -> Result<(), Target::AppendError> {
-        Record::new(&self.0, Class::In, self.1, &self.2).compose(target)
+        Record::new(&self.0, Class::IN, self.1, &self.2).compose(target)
     }
 }
 
@@ -584,8 +592,8 @@ impl<Name> RecordHeader<Name> {
     }
 }
 
-impl<'a, Octs: Octets + ?Sized> RecordHeader<ParsedDname<&'a Octs>> {
-    fn deref_owner(&self) -> RecordHeader<ParsedDname<Octs::Range<'a>>> {
+impl<'a, Octs: Octets + ?Sized> RecordHeader<ParsedName<&'a Octs>> {
+    fn deref_owner(&self) -> RecordHeader<ParsedName<Octs::Range<'a>>> {
         RecordHeader {
             owner: self.owner.deref_octets(),
             rtype: self.rtype,
@@ -630,7 +638,7 @@ impl<Name> RecordHeader<Name> {
 
 /// # Parsing and Composing
 ///
-impl<Octs> RecordHeader<ParsedDname<Octs>> {
+impl<Octs> RecordHeader<ParsedName<Octs>> {
     pub fn parse<'a, Src: Octets<Range<'a> = Octs>>(
         parser: &mut Parser<'a, Src>,
     ) -> Result<Self, ParseError> {
@@ -638,12 +646,12 @@ impl<Octs> RecordHeader<ParsedDname<Octs>> {
     }
 }
 
-impl<'a, Octs: AsRef<[u8]> + ?Sized> RecordHeader<ParsedDname<&'a Octs>> {
+impl<'a, Octs: AsRef<[u8]> + ?Sized> RecordHeader<ParsedName<&'a Octs>> {
     pub fn parse_ref(
         parser: &mut Parser<'a, Octs>,
     ) -> Result<Self, ParseError> {
         Ok(RecordHeader::new(
-            ParsedDname::parse_ref(parser)?,
+            ParsedName::parse_ref(parser)?,
             Rtype::parse(parser)?,
             Class::parse(parser)?,
             Ttl::parse(parser)?,
@@ -677,7 +685,7 @@ impl RecordHeader<()> {
     fn parse_rdlen<Octs: Octets + ?Sized>(
         parser: &mut Parser<Octs>,
     ) -> Result<u16, ParseError> {
-        ParsedDname::skip(parser)?;
+        ParsedName::skip(parser)?;
         parser.advance(
             (Rtype::COMPOSE_LEN + Class::COMPOSE_LEN + u32::COMPOSE_LEN)
                 .into(),
@@ -686,10 +694,10 @@ impl RecordHeader<()> {
     }
 }
 
-impl<Octs> RecordHeader<ParsedDname<Octs>> {
-    /// Parses the remainder of the record and returns it.
+impl<Octs> RecordHeader<ParsedName<Octs>> {
+    /// Parses the remainder of the record if the record data type supports it.
     ///
-    /// The method assumes that the parsers is currently positioned right
+    /// The method assumes that the parser is currently positioned right
     /// after the end of the record header. If the record data type `D`
     /// feels capable of parsing a record with a header of `self`, the
     /// method will parse the data and return a full `Record<D>`. Otherwise,
@@ -697,7 +705,7 @@ impl<Octs> RecordHeader<ParsedDname<Octs>> {
     pub fn parse_into_record<'a, Src, Data>(
         self,
         parser: &mut Parser<'a, Src>,
-    ) -> Result<Option<Record<ParsedDname<Octs>, Data>>, ParseError>
+    ) -> Result<Option<Record<ParsedName<Octs>, Data>>, ParseError>
     where
         Src: AsRef<[u8]> + ?Sized,
         Data: ParseRecordData<'a, Src>,
@@ -713,10 +721,14 @@ impl<Octs> RecordHeader<ParsedDname<Octs>> {
         Ok(res)
     }
 
+    /// Parses the remainder of the record.
+    ///
+    /// The method assumes that the parser is currently positioned right
+    /// after the end of the record header.
     pub fn parse_into_any_record<'a, Src, Data>(
         self,
         parser: &mut Parser<'a, Src>,
-    ) -> Result<Record<ParsedDname<Octs>, Data>, ParseError>
+    ) -> Result<Record<ParsedName<Octs>, Data>, ParseError>
     where
         Src: AsRef<[u8]> + ?Sized,
         Data: ParseAnyRecordData<'a, Src>,
@@ -737,12 +749,12 @@ impl<Octs> RecordHeader<ParsedDname<Octs>> {
     }
 }
 
-impl<Name: ToDname> RecordHeader<Name> {
+impl<Name: ToName> RecordHeader<Name> {
     pub fn compose<Target: Composer + ?Sized>(
         &self,
         buf: &mut Target,
     ) -> Result<(), Target::AppendError> {
-        buf.append_compressed_dname(&self.owner)?;
+        buf.append_compressed_name(&self.owner)?;
         self.rtype.compose(buf)?;
         self.class.compose(buf)?;
         self.ttl.compose(buf)?;
@@ -765,8 +777,8 @@ impl<Name: ToDname> RecordHeader<Name> {
 
 impl<Name, NName> PartialEq<RecordHeader<NName>> for RecordHeader<Name>
 where
-    Name: ToDname,
-    NName: ToDname,
+    Name: ToName,
+    NName: ToName,
 {
     fn eq(&self, other: &RecordHeader<NName>) -> bool {
         self.owner.name_eq(&other.owner)
@@ -777,7 +789,7 @@ where
     }
 }
 
-impl<Name: ToDname> Eq for RecordHeader<Name> {}
+impl<Name: ToName> Eq for RecordHeader<Name> {}
 
 //--- PartialOrd and Ord
 //
@@ -785,8 +797,8 @@ impl<Name: ToDname> Eq for RecordHeader<Name> {}
 
 impl<Name, NName> PartialOrd<RecordHeader<NName>> for RecordHeader<Name>
 where
-    Name: ToDname,
-    NName: ToDname,
+    Name: ToName,
+    NName: ToName,
 {
     fn partial_cmp(&self, other: &RecordHeader<NName>) -> Option<Ordering> {
         match self.owner.name_cmp(&other.owner) {
@@ -809,7 +821,7 @@ where
     }
 }
 
-impl<Name: ToDname> Ord for RecordHeader<Name> {
+impl<Name: ToName> Ord for RecordHeader<Name> {
     fn cmp(&self, other: &Self) -> Ordering {
         match self.owner.name_cmp(&other.owner) {
             Ordering::Equal => {}
@@ -877,7 +889,7 @@ impl<Name: fmt::Debug> fmt::Debug for RecordHeader<Name> {
 #[derive(Clone)]
 pub struct ParsedRecord<'a, Octs: Octets + ?Sized> {
     /// The record’s header.
-    header: RecordHeader<ParsedDname<&'a Octs>>,
+    header: RecordHeader<ParsedName<&'a Octs>>,
 
     /// A parser positioned at the beginning of the record’s data.
     data: Parser<'a, Octs>,
@@ -890,7 +902,7 @@ impl<'a, Octs: Octets + ?Sized> ParsedRecord<'a, Octs> {
     /// first byte of the record data.
     #[must_use]
     pub fn new(
-        header: RecordHeader<ParsedDname<&'a Octs>>,
+        header: RecordHeader<ParsedName<&'a Octs>>,
         data: Parser<'a, Octs>,
     ) -> Self {
         ParsedRecord { header, data }
@@ -898,7 +910,7 @@ impl<'a, Octs: Octets + ?Sized> ParsedRecord<'a, Octs> {
 
     /// Returns a reference to the owner of the record.
     #[must_use]
-    pub fn owner(&self) -> ParsedDname<&'a Octs> {
+    pub fn owner(&self) -> ParsedName<&'a Octs> {
         *self.header.owner()
     }
 
@@ -928,7 +940,7 @@ impl<'a, Octs: Octets + ?Sized> ParsedRecord<'a, Octs> {
 }
 
 impl<'a, Octs: Octets + ?Sized> ParsedRecord<'a, Octs> {
-    /// Creates a real resource record from the parsed record.
+    /// Creates a real resource record if the record data type supports it.
     ///
     /// The method is generic over a type that knows how to parse record
     /// data via the [`ParseRecordData`] trait. The record data is given to
@@ -937,12 +949,10 @@ impl<'a, Octs: Octets + ?Sized> ParsedRecord<'a, Octs> {
     /// the method returns `Ok(Some(_))`. It returns `Ok(None)` if the trait
     /// doesn’t know how to parse this particular record type. It returns
     /// an error if parsing fails.
-    ///
-    /// [`ParseRecordData`]: ../rdata/trait.ParseRecordData.html
     #[allow(clippy::type_complexity)]
     pub fn to_record<Data>(
         &self,
-    ) -> Result<Option<Record<ParsedDname<Octs::Range<'_>>, Data>>, ParseError>
+    ) -> Result<Option<Record<ParsedName<Octs::Range<'_>>, Data>>, ParseError>
     where
         Data: ParseRecordData<'a, Octs>,
     {
@@ -951,7 +961,23 @@ impl<'a, Octs: Octets + ?Sized> ParsedRecord<'a, Octs> {
             .parse_into_record(&mut self.data.clone())
     }
 
-    /// Trades the parsed record for a real resource record.
+    /// Creates a real resource record.
+    ///
+    /// The method is generic over a type that knows how to parse record
+    /// data via the [`ParseAnyRecordData`] trait. The record data is given to
+    /// this trait for parsing.
+    pub fn to_any_record<Data>(
+        &self,
+    ) -> Result<Record<ParsedName<Octs::Range<'_>>, Data>, ParseError>
+    where
+        Data: ParseAnyRecordData<'a, Octs>,
+    {
+        self.header
+            .deref_owner()
+            .parse_into_any_record(&mut self.data.clone())
+    }
+
+    /// Trades for a real resource record if the record data type supports it.
     ///
     /// The method is generic over a type that knows how to parse record
     /// data via the [`ParseRecordData`] trait. The record data is given to
@@ -960,21 +986,24 @@ impl<'a, Octs: Octets + ?Sized> ParsedRecord<'a, Octs> {
     /// the method returns `Ok(Some(_))`. It returns `Ok(None)` if the trait
     /// doesn’t know how to parse this particular record type. It returns
     /// an error if parsing fails.
-    ///
-    /// [`ParseRecordData`]: ../rdata/trait.ParseRecordData.html
     #[allow(clippy::type_complexity)]
     pub fn into_record<Data>(
         mut self,
-    ) -> Result<Option<Record<ParsedDname<Octs::Range<'a>>, Data>>, ParseError>
+    ) -> Result<Option<Record<ParsedName<Octs::Range<'a>>, Data>>, ParseError>
     where
         Data: ParseRecordData<'a, Octs>,
     {
         self.header.deref_owner().parse_into_record(&mut self.data)
     }
 
+    /// Trades for a real resource record.
+    ///
+    /// The method is generic over a type that knows how to parse record
+    /// data via the [`ParseAnyRecordData`] trait. The record data is given to
+    /// this trait for parsing.    #[allow(clippy::type_complexity)]
     pub fn into_any_record<Data>(
         mut self,
-    ) -> Result<Record<ParsedDname<Octs::Range<'a>>, Data>, ParseError>
+    ) -> Result<Record<ParsedName<Octs::Range<'a>>, Data>, ParseError>
     where
         Data: ParseAnyRecordData<'a, Octs>,
     {
@@ -1580,24 +1609,24 @@ mod test {
     fn ds_octets_into() {
         use super::*;
         use crate::base::iana::{Class, DigestAlg, SecAlg};
-        use crate::base::name::Dname;
+        use crate::base::name::Name;
         use crate::rdata::Ds;
         use bytes::Bytes;
         use octseq::octets::OctetsInto;
 
-        let ds: Record<Dname<&[u8]>, Ds<&[u8]>> = Record::new(
-            Dname::from_octets(b"\x01a\x07example\0".as_ref()).unwrap(),
-            Class::In,
+        let ds: Record<Name<&[u8]>, Ds<&[u8]>> = Record::new(
+            Name::from_octets(b"\x01a\x07example\0".as_ref()).unwrap(),
+            Class::IN,
             Ttl::from_secs(86400),
             Ds::new(
                 12,
-                SecAlg::RsaSha256,
-                DigestAlg::Sha256,
+                SecAlg::RSASHA256,
+                DigestAlg::SHA256,
                 b"something".as_ref(),
             )
             .unwrap(),
         );
-        let ds_bytes: Record<Dname<Bytes>, Ds<Bytes>> =
+        let ds_bytes: Record<Name<Bytes>, Ds<Bytes>> =
             ds.clone().octets_into();
         assert_eq!(ds.owner(), ds_bytes.owner());
         assert_eq!(ds.data().digest(), ds_bytes.data().digest());

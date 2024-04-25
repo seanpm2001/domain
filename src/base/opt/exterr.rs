@@ -38,6 +38,11 @@ pub struct ExtendedError<Octs> {
     text: Option<Result<Str<Octs>, Octs>>,
 }
 
+impl ExtendedError<()> {
+    /// The option code for this option.
+    pub(super) const CODE: OptionCode = OptionCode::EXTENDED_ERROR;
+}
+
 impl<Octs> ExtendedError<Octs> {
     /// Creates a new value from a code and optional text.
     ///
@@ -170,7 +175,7 @@ where
 
 impl<Octs> OptData for ExtendedError<Octs> {
     fn code(&self) -> OptionCode {
-        OptionCode::ExtendedError
+        OptionCode::EXTENDED_ERROR
     }
 }
 
@@ -180,7 +185,7 @@ where Octs: Octets + ?Sized {
         code: OptionCode,
         parser: &mut Parser<'a, Octs>,
     ) -> Result<Option<Self>, ParseError> {
-        if code == OptionCode::ExtendedError {
+        if code == OptionCode::EXTENDED_ERROR {
             Self::parse(parser).map(Some)
         }
         else {
@@ -337,7 +342,7 @@ mod tests {
     #[allow(clippy::redundant_closure)] // lifetimes ...
     fn nsid_compose_parse() {
         let ede = ExtendedError::new(
-            ExtendedErrorCode::StaleAnswer,
+            ExtendedErrorCode::STALE_ANSWER,
             Some(Str::from_string("some text".into()))
         ).unwrap();
         test_option_compose_parse(
@@ -348,7 +353,7 @@ mod tests {
 
     #[test]
     fn private() {
-        let ede: ExtendedError<&[u8]> = ExtendedErrorCode::DnssecBogus.into();
+        let ede: ExtendedError<&[u8]> = ExtendedErrorCode::DNSSEC_BOGUS.into();
         assert!(!ede.is_private());
 
         let ede: ExtendedError<&[u8]> = EDE_PRIVATE_RANGE_BEGIN.into();

@@ -17,8 +17,9 @@ use crate::net::client::protocol::{
 use crate::net::client::request::{
     ComposeRequest, Error, GetResponse, SendRequest,
 };
+use crate::utils::config::DefMinMax;
 use bytes::Bytes;
-use core::{cmp, fmt};
+use core::fmt;
 use octseq::OctetsInto;
 use std::boxed::Box;
 use std::future::Future;
@@ -27,6 +28,7 @@ use std::sync::Arc;
 use std::{error, io};
 use tokio::sync::Semaphore;
 use tokio::time::{timeout_at, Duration, Instant};
+use tracing::trace;
 
 //------------ Configuration Constants ----------------------------------------
 
@@ -176,7 +178,7 @@ impl Default for Config {
 ///
 /// Because it owns the connection’s resources, this type is not `Clone`.
 /// However, it is entirely safe to share it by sticking it into e.g. an arc.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Connection<S> {
     state: Arc<ConnectionState<S>>,
 }
@@ -254,7 +256,7 @@ where
             }
 
             // Create the message and send it out.
-            let request_msg = request.to_message();
+            let request_msg = request.to_message()?;
             let dgram = request_msg.as_slice();
             let sent = sock.send(dgram).await.map_err(QueryError::send)?;
             if sent != dgram.len() {
@@ -277,9 +279,12 @@ where
                         }
                         Err(_) => {
                             // Timeout.
+                            trace!("Receive timed out");
                             break;
                         }
                     };
+
+                trace!("Received {len} bytes of message");
                 buf.truncate(len);
 
                 // We ignore garbage since there is a timer on this whole
@@ -288,6 +293,7 @@ where
                     Ok(answer) => answer,
                     Err(buf) => {
                         // Just go back to receiving.
+                        trace!("Received bytes were garbage, reading more");
                         reuse_buf = Some(buf);
                         continue;
                     }
@@ -295,23 +301,16 @@ where
 
                 if !request.is_answer(answer.for_slice()) {
                     // Wrong answer, go back to receiving
+                    trace!("Received message is not the answer we were waiting for, reading more");
                     reuse_buf = Some(answer.into_octets());
                     continue;
                 }
+
+                trace!("Received message is accepted");
                 return Ok(answer.octets_into());
             }
         }
         Err(QueryError::timeout().into())
-    }
-}
-
-//--- Clone
-
-impl<S> Clone for Connection<S> {
-    fn clone(&self) -> Self {
-        Self {
-            state: self.state.clone(),
-        }
     }
 }
 
@@ -324,7 +323,10 @@ where
         AsyncDgramRecv + AsyncDgramSend + Send + Sync + Unpin + 'static,
     Req: ComposeRequest + Clone + Send + Sync + 'static,
 {
-    fn send_request(&self, request_msg: Req) -> Box<dyn GetResponse + Send> {
+    fn send_request(
+        &self,
+        request_msg: Req,
+    ) -> Box<dyn GetResponse + Send + Sync> {
         Box::new(Request {
             fut: Box::pin(self.clone().handle_request_impl(request_msg)),
         })
@@ -336,7 +338,9 @@ where
 /// The state of a DNS request.
 pub struct Request {
     /// Future that does the actual work of GetResponse.
-    fut: Pin<Box<dyn Future<Output = Result<Message<Bytes>, Error>> + Send>>,
+    fut: Pin<
+        Box<dyn Future<Output = Result<Message<Bytes>, Error>> + Send + Sync>,
+    >,
 }
 
 impl Request {
@@ -356,44 +360,14 @@ impl GetResponse for Request {
     fn get_response(
         &mut self,
     ) -> Pin<
-        Box<dyn Future<Output = Result<Message<Bytes>, Error>> + Send + '_>,
+        Box<
+            dyn Future<Output = Result<Message<Bytes>, Error>>
+                + Send
+                + Sync
+                + '_,
+        >,
     > {
         Box::pin(self.get_response_impl())
-    }
-}
-
-//------------ DefMinMax -----------------------------------------------------
-
-/// The default, minimum, and maximum values for a config variable.
-#[derive(Clone, Copy)]
-struct DefMinMax<T> {
-    /// The default value,
-    def: T,
-
-    /// The minimum value,
-    min: T,
-
-    /// The maximum value,
-    max: T,
-}
-
-impl<T> DefMinMax<T> {
-    /// Creates a new value.
-    const fn new(def: T, min: T, max: T) -> Self {
-        Self { def, min, max }
-    }
-
-    /// Returns the default value.
-    fn default(self) -> T {
-        self.def
-    }
-
-    /// Trims the given value to fit into the minimum/maximum range.
-    fn limit(self, value: T) -> T
-    where
-        T: Ord,
-    {
-        cmp::max(self.min, cmp::min(self.max, value))
     }
 }
 

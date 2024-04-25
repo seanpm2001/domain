@@ -50,6 +50,9 @@ pub struct ClientSubnet {
 }
 
 impl ClientSubnet {
+    /// The option code for this option.
+    pub(super) const CODE: OptionCode = OptionCode::CLIENT_SUBNET;
+    
     /// Creates a new client subnet value.
     ///
     /// The function is very forgiving regarding the arguments and corrects
@@ -170,7 +173,10 @@ impl ClientSubnet {
         })
     }
 
-    pub(crate) fn try_octets_from<E>(src: Self) -> Result<Self, E> {
+    /// Placeholder for unnecessary octets conversion.
+    ///
+    /// This method only exists for the `AllOptData` macro.
+    pub(super) fn try_octets_from<E>(src: Self) -> Result<Self, E> {
         Ok(src)
     }
 }
@@ -179,7 +185,7 @@ impl ClientSubnet {
 
 impl OptData for ClientSubnet {
     fn code(&self) -> OptionCode {
-        OptionCode::ClientSubnet
+        OptionCode::CLIENT_SUBNET
     }
 }
 
@@ -188,7 +194,7 @@ impl<'a, Octs: AsRef<[u8]>> ParseOptData<'a, Octs> for ClientSubnet {
         code: OptionCode,
         parser: &mut Parser<'a, Octs>,
     ) -> Result<Option<Self>, ParseError> {
-        if code == OptionCode::ClientSubnet {
+        if code == OptionCode::CLIENT_SUBNET {
             Self::parse(parser).map(Some)
         }
         else {

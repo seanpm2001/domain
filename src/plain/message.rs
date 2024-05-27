@@ -118,7 +118,7 @@ impl Message {
 impl Message {
     /// Creates a message from a base message.
     pub fn from_base<Octs: Octets>(
-        msg: base::Message<Octs>,
+        msg: &base::Message<Octs>,
     ) -> Result<Self, ParseError>
     where
         Bytes: for<'a> OctetsFrom<Octs::Range<'a>, Error = Infallible>,
@@ -170,6 +170,7 @@ impl Message {
 
 /// The OPT record of a message.
 #[derive(Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Opt {
     /// The UDP payload size field from the record header.
     udp_payload_size: u16,
@@ -234,7 +235,9 @@ impl Opt {
 /// elements to the section fail rather than panic if the section runs out of
 /// space.
 #[derive(Clone, Hash, Eq, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Section<T, const N: usize> {
+    #[cfg_attr(feature = "serde", serde(flatten))]
     elements: Vec<T>,
 }
 
@@ -265,7 +268,7 @@ impl<T, const N: usize> Section<T, N> {
 }
 
 impl<const N: usize> Section<Question, N> {
-    pub fn from_base<Octs: Octets>(
+    pub fn from_base<Octs: Octets + ?Sized>(
         base: message::QuestionSection<Octs>,
     ) -> Result<Self, ParseError>
     where

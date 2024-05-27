@@ -23,31 +23,31 @@ use bytes::Bytes;
 pub type CharStr = base::charstr::CharStr<Bytes>;
 
 /// An uncompressed, absolute domain name.
-pub type Dname = base::name::Dname<Bytes>;
+pub type Name = base::name::Name<Bytes>;
 
 /// An uncompressed, relative domain name.
-pub type RelativeDname = base::name::RelativeDname<Bytes>;
+pub type RelativeName = base::name::RelativeName<Bytes>;
 
 /// A domain name that may be absolute or relative.
-pub type UncertainDname = base::name::UncertainDname<Bytes>;
+pub type UncertainName = base::name::UncertainName<Bytes>;
 
 /// A question in a DNS message.
-pub type Question = base::question::Question<Dname>;
+pub type Question = base::question::Question<Name>;
 
 /// Record data for all record types.
-pub type AllRecordData = rdata::AllRecordData<Bytes, Dname>;
+pub type AllRecordData = rdata::AllRecordData<Bytes, Name>;
 
 /// Record data for all record types allowed in zonefiles.
-pub type ZoneRecordData = rdata::ZoneRecordData<Bytes, Dname>;
+pub type ZoneRecordData = rdata::ZoneRecordData<Bytes, Name>;
 
 /// Generic record data.
 pub type UnknownRecordData = base::rdata::UnknownRecordData<Bytes>;
 
 /// A resource record covering all record types.
-pub type Record = base::record::Record<Dname, AllRecordData>;
+pub type Record = base::record::Record<Name, AllRecordData>;
 
 /// A resource record covering all record types allowed in zonefiles.
-pub type ZoneRecord = base::record::Record<Dname, ZoneRecordData>;
+pub type ZoneRecord = base::record::Record<Name, ZoneRecordData>;
 
 /// Option data for all option types.
-pub type AllOptData = base::opt::AllOptData<Bytes, Dname>;
+pub type AllOptData = base::opt::AllOptData<Bytes, Name>;

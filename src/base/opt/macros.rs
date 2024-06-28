@@ -25,37 +25,6 @@ macro_rules! opt_types {
             Other(UnknownOptData<Octs>),
         }
 
-        //--- OctetsFrom
-
-        impl<Octs, Name, SrcOcts, SrcName>
-        OctetsFrom<AllOptData<SrcOcts, SrcName>>
-        for AllOptData<Octs, Name>
-        where
-            Octs: OctetsFrom<SrcOcts>,
-            Name: OctetsFrom<SrcName, Error = Octs::Error>,
-        {
-            type Error = Octs::Error;
-
-            fn try_octets_from(
-                source: AllOptData<SrcOcts, SrcName>,
-            ) -> Result<Self, Self::Error> {
-                match source {
-                    $( $(
-                        AllOptData::$opt(opt) => {
-                            Ok(AllOptData::$opt(
-                                $module::$opt::try_octets_from(opt)?
-                            ))
-                        },
-                    )* )*
-                    AllOptData::Other(opt) => {
-                        Ok(AllOptData::Other(
-                            UnknownOptData::try_octets_from(opt)?
-                        ))
-                    }
-                }
-            }
-        }
-
         //--- From
 
         $( $(
@@ -113,7 +82,7 @@ macro_rules! opt_types {
             }
         }
 
-        impl<'a, Octs: Octets> ParseOptData<'a, Octs>
+        impl<'a, Octs: Octets + ?Sized> ParseOptData<'a, Octs>
         for AllOptData<Octs::Range<'a>, Name<Octs::Range<'a>>> {
             fn parse_option(
                 code: OptionCode,

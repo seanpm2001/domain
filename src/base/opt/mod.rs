@@ -187,7 +187,7 @@ impl<Octs: AsRef<[u8]> + ?Sized> Opt<Octs> {
     /// Returns an iterator over all options.
     pub fn iter_all(
         &self,
-    ) -> OptIter<Octs, AllOptData<Octs::Range<'_>, Dname<Octs::Range<'_>>>>
+    ) -> OptIter<Octs, AllOptData<Octs::Range<'_>, Name<Octs::Range<'_>>>>
     where
         Octs: Octets,
     {

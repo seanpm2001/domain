@@ -1,19 +1,18 @@
 //! Convenient representations of DNS messages.
-#![allow(dead_code)]
 
 use super::{AllOptData, Question, Record};
 use crate::base;
 use crate::base::header::{Header, HeaderCounts};
 use crate::base::message;
 use crate::base::name::FlattenInto;
-use crate::base::opt::{ComposeOptData, OptData, OptHeader, OptRecord};
+use crate::base::opt::{ComposeOptData, OptHeader, OptData, OptRecord};
 use crate::base::wire::{Compose, Composer, ParseError};
 use crate::rdata::AllRecordData;
 use bytes::Bytes;
 use octseq::{Octets, OctetsFrom, OctetsInto};
 use std::convert::Infallible;
-use std::prelude::rust_2021::*;
-use std::{borrow, cmp, error, fmt, ops, slice, vec};
+use std::{borrow, error, fmt, ops, slice, vec};
+use std::vec::Vec;
 
 //------------ Message -------------------------------------------------------
 
@@ -36,19 +35,19 @@ pub struct Message {
     header: Header,
 
     /// The question section.
-    question: QuestionSection,
+    question: Section<Question>,
 
     /// The answer section.
-    answer: RecordSection,
+    answer: Section<Record>,
 
-    /// The section.
-    authority: RecordSection,
+    /// The authority section.
+    authority: Section<Record>,
 
     /// The additional section.
     ///
     /// This section should not include the OPT record nor any records
     /// coming after the OPT record, e.g., TSIG.
-    additional: AdditionalSection,
+    additional: Section<Record>,
 
     /// The OPT record.
     opt: Opt,
@@ -61,32 +60,32 @@ impl Message {
     }
 
     /// Returns a reference to the question section.
-    pub fn question(&self) -> &QuestionSection {
+    pub fn question(&self) -> &Section<Question> {
         &self.question
     }
 
     /// Returns a mutable reference to the question section.
-    pub fn question_mut(&mut self) -> &mut QuestionSection {
+    pub fn question_mut(&mut self) -> &mut Section<Question> {
         &mut self.question
     }
 
     /// Returns a reference to the answer section.
-    pub fn answer(&self) -> &RecordSection {
+    pub fn answer(&self) -> &Section<Record> {
         &self.answer
     }
 
     /// Returns a mutable reference to the answer section.
-    pub fn answer_mut(&mut self) -> &mut RecordSection {
+    pub fn answer_mut(&mut self) -> &mut Section<Record> {
         &mut self.answer
     }
 
     /// Returns a reference to the authority section.
-    pub fn authority(&self) -> &RecordSection {
+    pub fn authority(&self) -> &Section<Record> {
         &self.authority
     }
 
     /// Returns a mutable reference to the authority section.
-    pub fn authority_mut(&mut self) -> &mut RecordSection {
+    pub fn authority_mut(&mut self) -> &mut Section<Record> {
         &mut self.authority
     }
 
@@ -94,12 +93,12 @@ impl Message {
     ///
     /// The authority section of this type of message does not contain the
     /// OPT record or any records following the OPT record.
-    pub fn additional(&self) -> &AdditionalSection {
+    pub fn additional(&self) -> &Section<Record> {
         &self.additional
     }
 
     /// Returns a mutable reference to the additional section.
-    pub fn additional_mut(&mut self) -> &mut AdditionalSection {
+    pub fn additional_mut(&mut self) -> &mut Section<Record> {
         &mut self.additional
     }
 
@@ -125,11 +124,11 @@ impl Message {
     {
         let header = msg.header();
         let section = msg.question();
-        let question = QuestionSection::from_base(section)?;
+        let question = Section::<Question>::from_base(section)?;
         let section = section.next_section()?;
-        let answer = RecordSection::from_base(section)?;
+        let answer = Section::<Record>::from_base(section)?;
         let section = section.next_section()?.unwrap();
-        let authority = RecordSection::from_base(section)?;
+        let authority = Section::<Record>::from_base(section)?;
         let section = section.next_section()?.unwrap();
         let (opt, additional) = Section::additional_from_base(section)?;
 
@@ -147,7 +146,16 @@ impl Message {
     pub fn compose<Target: Composer + ?Sized>(
         &self,
         target: &mut Target,
-    ) -> Result<(), Target::AppendError> {
+    ) -> Result<(), ComposeError<Target::AppendError>> {
+        // Check that all the sections are small enough to fit in a message
+        if self.question.len() > MAX_SECTION_LEN
+            || self.answer.len() > MAX_SECTION_LEN
+            || self.authority.len() > MAX_SECTION_LEN
+            || self.additional.len() > MAX_SECTION_LEN - 1
+        {
+            return Err(ComposeError::Exhausted(()));
+        }
+
         target.append_slice(self.header.as_slice())?;
         target.append_slice(
             HeaderCounts::from_counts(
@@ -162,6 +170,7 @@ impl Message {
         self.answer.compose(target)?;
         self.authority.compose(target)?;
         self.additional.compose(target)?;
+        self.opt.compose(target)?;
         Ok(())
     }
 }
@@ -170,7 +179,6 @@ impl Message {
 
 /// The OPT record of a message.
 #[derive(Clone, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Opt {
     /// The UDP payload size field from the record header.
     udp_payload_size: u16,
@@ -196,7 +204,7 @@ impl Opt {
         for item in base.opt().iter_all() {
             let item = item?;
             rdlen += item.compose_len();
-            data.push(item.octets_into());
+            data.push(item);
         }
         Ok(Opt {
             udp_payload_size: base.udp_payload_size(),
@@ -215,6 +223,7 @@ impl Opt {
         let mut header = OptHeader::default();
         header.set_udp_payload_size(self.udp_payload_size);
         header.set_ext_rcode(self.ext_rcode);
+        header.set_version(self.version);
         header.set_dnssec_ok(self.dnssec_ok);
         target.append_slice(header.as_slice())?;
         self.rdlen.compose(target)?;
@@ -236,23 +245,19 @@ impl Opt {
 /// space.
 #[derive(Clone, Hash, Eq, Ord, PartialEq, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Section<T, const N: usize> {
+pub struct Section<T> {
     #[cfg_attr(feature = "serde", serde(flatten))]
     elements: Vec<T>,
 }
 
-pub type QuestionSection = Section<Question, MAX_SECTION_LEN>;
-pub type RecordSection = Section<Record, MAX_SECTION_LEN>;
-pub type AdditionalSection = Section<Record, { MAX_SECTION_LEN - 1 }>;
-
-impl<T, const N: usize> Section<T, N> {
+impl<T> Section<T> {
     /// Creates a new, empty section.
     pub fn new() -> Self {
         Default::default()
     }
 
     /// Creates a section from a vec without checking the length.
-    fn from_vec_unchecked(elements: Vec<T>) -> Self {
+    fn from_vec(elements: Vec<T>) -> Self {
         Self { elements }
     }
 
@@ -262,24 +267,25 @@ impl<T, const N: usize> Section<T, N> {
     /// elements, whatever is smaller.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            elements: Vec::with_capacity(cmp::min(capacity, N)),
+            elements: Vec::with_capacity(capacity),
         }
     }
 }
 
-impl<const N: usize> Section<Question, N> {
-    pub fn from_base<Octs: Octets + ?Sized>(
+impl Section<Question> {
+    pub fn from_base<Octs: Octets + ?Sized, E: Into<Infallible>>(
         base: message::QuestionSection<Octs>,
     ) -> Result<Self, ParseError>
     where
-        Bytes: for<'a> OctetsFrom<Octs::Range<'a>, Error = Infallible>,
+        Bytes: for<'a> OctetsFrom<Octs::Range<'a>, Error = E>,
     {
         let mut vec = Vec::new();
         for item in base {
             let item = item?;
-            vec.push(item.flatten_into());
+            let item = item.flatten_into();
+            vec.push(item);
         }
-        Ok(Self::from_vec_unchecked(vec))
+        Ok(Self::from_vec(vec))
     }
 
     fn compose<Target: Composer + ?Sized>(
@@ -292,7 +298,7 @@ impl<const N: usize> Section<Question, N> {
     }
 }
 
-impl<const N: usize> Section<Record, N> {
+impl Section<Record> {
     pub fn from_base<Octs: Octets>(
         base: message::RecordSection<Octs>,
     ) -> Result<Self, ParseError>
@@ -304,7 +310,7 @@ impl<const N: usize> Section<Record, N> {
             let item = item?;
             vec.push(item.flatten_into());
         }
-        Ok(Self::from_vec_unchecked(vec))
+        Ok(Self::from_vec(vec))
     }
 
     fn additional_from_base<Octs: Octets>(
@@ -325,7 +331,7 @@ impl<const N: usize> Section<Record, N> {
                 Err(item) => vec.push(item.flatten_into()),
             }
         }
-        Ok((opt.unwrap_or_default(), Self::from_vec_unchecked(vec)))
+        Ok((opt.unwrap_or_default(), Self::from_vec(vec)))
     }
 
     fn compose<Target: Composer + ?Sized>(
@@ -338,7 +344,7 @@ impl<const N: usize> Section<Record, N> {
     }
 }
 
-impl<T, const N: usize> Section<T, N> {
+impl<T> Section<T> {
     /// Returns the capacity of the section.
     pub fn capacity(&self) -> usize {
         self.elements.capacity()
@@ -350,8 +356,7 @@ impl<T, const N: usize> Section<T, N> {
     /// `self.len() + additional` elements or 65,535 elements, whatever is
     /// smaller.
     pub fn reserve(&mut self, additional: usize) {
-        self.elements
-            .reserve(cmp::min(additional, N.saturating_sub(self.len())))
+        self.elements.reserve(additional)
     }
 
     /// Reserves capacity for exactly this many more elements.
@@ -362,8 +367,7 @@ impl<T, const N: usize> Section<T, N> {
     /// Note that because the number of elements can not exceed 65,535, the
     /// method will actually reserve less space than requested.
     pub fn reserve_exact(&mut self, additional: usize) {
-        self.elements
-            .reserve(cmp::min(additional, N.saturating_sub(self.len())))
+        self.elements.reserve_exact(additional)
     }
 
     /// Returns the number of elements in the section.
@@ -397,24 +401,12 @@ impl<T, const N: usize> Section<T, N> {
     }
 }
 
-impl<T, const N: usize> Section<T, N> {
-    /// Checks that an additional _len_ number of elements can be added.
-    fn check_append_len(&self, other: usize) -> Result<(), Exhausted> {
-        // This also works safely with 16 bit pointer sizes.
-        match self.elements.len().checked_add(other) {
-            None => Err(Exhausted(())),
-            Some(len) if len > N => Err(Exhausted(())),
-            _ => Ok(()),
-        }
-    }
-
+impl<T> Section<T> {
     /// Appends an element to the end of the section.
     ///
     /// Returns an error if the element doesn’t fit.
-    pub fn push(&mut self, element: T) -> Result<(), Exhausted> {
-        self.check_append_len(1)?;
-        self.elements.push(element);
-        Ok(())
+    pub fn push(&mut self, element: T) {
+        self.elements.push(element)
     }
 
     /// Inserts an element at the given index.
@@ -422,52 +414,31 @@ impl<T, const N: usize> Section<T, N> {
     /// The existing elements with an index equal or greater are shifted to
     /// a position with an index incremented by one.
     ///
-    /// Returns an error if no additional elements fit into the section.
-    ///
     /// # Panics
     ///
     /// Panics if the index is out of bounds.
-    pub fn insert(
-        &mut self,
-        index: usize,
-        element: T,
-    ) -> Result<(), Exhausted> {
-        self.check_append_len(1)?;
-        self.elements.insert(index, element);
-        Ok(())
+    pub fn insert(&mut self, index: usize, element: T) {
+        self.elements.insert(index, element)
     }
 
     /// Moves all elements of `other` in `self`, leaving `other` empty.
-    ///
-    /// If adding all elements would exceed the size limit, returns an error
-    /// and does nothing.
-    pub fn append<const M: usize>(
-        &mut self,
-        other: &mut Section<T, M>,
-    ) -> Result<(), Exhausted> {
-        self.check_append_len(other.elements.len())?;
-        self.elements.append(&mut other.elements);
-        Ok(())
+    pub fn append<const M: usize>(&mut self, other: &mut Section<T>) {
+        self.elements.append(&mut other.elements)
     }
 
     /// Clones and adds all elements in the given slice.
     ///
     /// Iterates over the slice, clones each element and appends it to the
     /// section.
-    ///
-    /// If adding all elements would exceed the size limit, returns an error
-    /// and does nothing.
-    pub fn extend_from_slice(&mut self, other: &[T]) -> Result<(), Exhausted>
+    pub fn extend_from_slice(&mut self, other: &[T])
     where
         T: Clone,
     {
-        self.check_append_len(other.len())?;
-        self.elements.extend_from_slice(other);
-        Ok(())
+        self.elements.extend_from_slice(other)
     }
 }
 
-impl<T, const N: usize> Section<T, N> {
+impl<T> Section<T> {
     /// Removes the last element from the section and returns it.
     ///
     /// Returns `None` if the section is empty.
@@ -588,7 +559,7 @@ impl<T, const N: usize> Section<T, N> {
 
 //--- Default
 
-impl<T, const N: usize> Default for Section<T, N> {
+impl<T> Default for Section<T> {
     fn default() -> Self {
         Self {
             elements: Default::default(),
@@ -601,53 +572,35 @@ impl<T, const N: usize> Default for Section<T, N> {
 // Because a section can become full, most of these are TryFrom impls where
 // Vec<T> actually has From impls.
 
-impl<T, const N: usize> TryFrom<Vec<T>> for Section<T, N> {
-    type Error = Exhausted;
-
-    fn try_from(src: Vec<T>) -> Result<Self, Self::Error> {
-        if src.len() > N {
-            Err(Exhausted(()))
-        } else {
-            Ok(Self::from_vec_unchecked(src))
-        }
+impl<T> From<Vec<T>> for Section<T> {
+    fn from(src: Vec<T>) -> Self {
+        Self::from_vec(src)
     }
 }
 
-impl<T: Clone, const N: usize> TryFrom<&[T]> for Section<T, N> {
-    type Error = Exhausted;
-
-    fn try_from(src: &[T]) -> Result<Self, Self::Error> {
-        if src.len() > N {
-            Err(Exhausted(()))
-        } else {
-            Ok(Self::from_vec_unchecked(src.into()))
-        }
+impl<T: Clone> From<&[T]> for Section<T> {
+    fn from(src: &[T]) -> Self {
+        Self::from_vec(src.into())
     }
 }
 
-/// Creates a section from an array.
-///
-/// # Panics
-///
-/// This will panic if `N` is larger than `u16::MAX`.
-impl<T, const M: usize, const N: usize> From<[T; M]> for Section<T, N> {
-    fn from(src: [T; M]) -> Self {
-        assert!(M <= N);
-        Self::from_vec_unchecked(src.into())
+impl<T, const N: usize> From<[T; N]> for Section<T> {
+    fn from(src: [T; N]) -> Self {
+        Self::from_vec(src.into())
     }
 }
 
-impl<T, const M: usize, const N: usize> TryFrom<Section<T, N>> for [T; M] {
-    type Error = Section<T, N>;
+impl<T, const N: usize> TryFrom<Section<T>> for [T; N] {
+    type Error = Section<T>;
 
-    fn try_from(src: Section<T, N>) -> Result<Self, Self::Error> {
-        src.elements.try_into().map_err(Section::from_vec_unchecked)
+    fn try_from(src: Section<T>) -> Result<Self, Self::Error> {
+        src.elements.try_into().map_err(Section::from_vec)
     }
 }
 
 //--- Deref and DerefMut, AsRef and AsRefMut, Borrow and BorrowMut
 
-impl<T, const N: usize> ops::Deref for Section<T, N> {
+impl<T> ops::Deref for Section<T> {
     type Target = [T];
 
     fn deref(&self) -> &Self::Target {
@@ -655,45 +608,47 @@ impl<T, const N: usize> ops::Deref for Section<T, N> {
     }
 }
 
-impl<T, const N: usize> ops::DerefMut for Section<T, N> {
+impl<T> ops::DerefMut for Section<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.as_mut_slice()
     }
 }
 
-impl<T, const N: usize> AsRef<[T]> for Section<T, N> {
+impl<T> AsRef<[T]> for Section<T> {
     fn as_ref(&self) -> &[T] {
         self.as_slice()
     }
 }
 
-impl<T, const N: usize> AsMut<[T]> for Section<T, N> {
+impl<T> AsMut<[T]> for Section<T> {
     fn as_mut(&mut self) -> &mut [T] {
         self.as_mut_slice()
     }
 }
 
-impl<T, const N: usize> borrow::Borrow<[T]> for Section<T, N> {
+impl<T> borrow::Borrow<[T]> for Section<T> {
     fn borrow(&self) -> &[T] {
         self.as_slice()
     }
 }
 
-impl<T, const N: usize> borrow::BorrowMut<[T]> for Section<T, N> {
+impl<T> borrow::BorrowMut<[T]> for Section<T> {
     fn borrow_mut(&mut self) -> &mut [T] {
         self.as_mut_slice()
     }
 }
 
 //--- Extend
-//
-// No extend because it never fails.
+
+impl<T> Extend<T> for Section<T> {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        self.elements.extend(iter)
+    }
+}
 
 //--- Index and IndexMut
 
-impl<T, const N: usize, I: slice::SliceIndex<[T]>> ops::Index<I>
-    for Section<T, N>
-{
+impl<T, I: slice::SliceIndex<[T]>> ops::Index<I> for Section<T> {
     type Output = I::Output;
 
     #[inline]
@@ -702,9 +657,7 @@ impl<T, const N: usize, I: slice::SliceIndex<[T]>> ops::Index<I>
     }
 }
 
-impl<T, const N: usize, I: slice::SliceIndex<[T]>> ops::IndexMut<I>
-    for Section<T, N>
-{
+impl<T, I: slice::SliceIndex<[T]>> ops::IndexMut<I> for Section<T> {
     #[inline]
     fn index_mut(&mut self, index: I) -> &mut Self::Output {
         self.elements.index_mut(index)
@@ -713,7 +666,7 @@ impl<T, const N: usize, I: slice::SliceIndex<[T]>> ops::IndexMut<I>
 
 //--- IntoIterator
 
-impl<T, const N: usize> IntoIterator for Section<T, N> {
+impl<T> IntoIterator for Section<T> {
     type Item = T;
     type IntoIter = vec::IntoIter<T>;
 
@@ -722,7 +675,7 @@ impl<T, const N: usize> IntoIterator for Section<T, N> {
     }
 }
 
-impl<'a, T, const N: usize> IntoIterator for &'a Section<T, N> {
+impl<'a, T> IntoIterator for &'a Section<T> {
     type Item = &'a T;
     type IntoIter = slice::Iter<'a, T>;
 
@@ -731,7 +684,7 @@ impl<'a, T, const N: usize> IntoIterator for &'a Section<T, N> {
     }
 }
 
-impl<'a, T, const N: usize> IntoIterator for &'a mut Section<T, N> {
+impl<'a, T> IntoIterator for &'a mut Section<T> {
     type Item = &'a mut T;
     type IntoIter = slice::IterMut<'a, T>;
 
@@ -752,16 +705,30 @@ const MAX_SECTION_LEN: usize = u16::MAX as usize;
 
 //============ Errors ========================================================
 
-//------------ Exhausted -----------------------------------------------------
+//------------ ComposeError --------------------------------------------------
 
 /// A section’s space is exhausted.
 #[derive(Clone, Copy, Debug)]
-pub struct Exhausted(());
+pub enum ComposeError<A> {
+    Exhausted(()),
+    AppendError(A),
+}
 
-impl fmt::Display for Exhausted {
+impl<A: fmt::Display> fmt::Display for ComposeError<A> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str("section space exhausted")
+        match self {
+            ComposeError::Exhausted(()) => {
+                f.write_str("section space exhausted")
+            }
+            ComposeError::AppendError(e) => e.fmt(f),
+        }
     }
 }
 
-impl error::Error for Exhausted {}
+impl<A: fmt::Debug + fmt::Display> error::Error for ComposeError<A> {}
+
+impl<A> From<A> for ComposeError<A> {
+    fn from(value: A) -> Self {
+        ComposeError::AppendError(value)
+    }
+}

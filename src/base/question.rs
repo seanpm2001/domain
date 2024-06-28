@@ -6,7 +6,7 @@
 
 use super::cmp::CanonicalOrd;
 use super::iana::{Class, Rtype};
-use super::name;
+use super::name::{self, FlattenInto};
 use super::name::{ParsedName, ToName};
 use super::wire::{Composer, ParseError};
 use core::cmp::Ordering;
@@ -208,6 +208,21 @@ where
             source.qtype,
             source.qclass,
         ))
+    }
+}
+
+//--- FlattenInto
+
+impl<N, M> FlattenInto<Question<M>> for Question<N> 
+where N: FlattenInto<M> {
+    type AppendError = N::AppendError;
+
+    fn try_flatten_into(self) -> Result<Question<M>, Self::AppendError> {
+        Ok(Question {
+            qname: self.qname.try_flatten_into()?,
+            qtype: self.qtype,
+            qclass: self.qclass,
+        })
     }
 }
 

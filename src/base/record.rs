@@ -196,10 +196,10 @@ impl<Name, Data> Record<Name, Data> {
     }
 }
 
-impl<OName: ToDname, DOcts, DName>
-    Record<OName, AllRecordData<DOcts, DName>>
+impl<OName: ToName, Octs, Name>
+    Record<OName, AllRecordData<Octs, Name>>
 {
-    pub fn try_into_opt(self) -> Result<OptRecord<DOcts>, Self> {
+    pub fn try_into_opt(self) -> Result<OptRecord<Octs>, Self> {
         match self.data {
             AllRecordData::Opt(opt) => Ok(OptRecord::from_record(
                 Record::new(self.owner, self.class, self.ttl, opt),

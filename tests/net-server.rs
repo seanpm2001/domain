@@ -1,5 +1,4 @@
 #![cfg(feature = "net")]
-mod net;
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -30,18 +29,19 @@ use domain::net::server::service::{
 };
 use domain::net::server::stream::StreamServer;
 use domain::net::server::util::{mk_builder_for_target, service_fn};
+use domain::utils::base16;
 use domain::zonefile::inplace::{Entry, ScannedRecord, Zonefile};
 
-use net::stelline::channel::ClientServerChannel;
-use net::stelline::client::do_client;
-use net::stelline::client::ClientFactory;
-use net::stelline::client::{
+use domain::stelline::channel::ClientServerChannel;
+use domain::stelline::client::do_client;
+use domain::stelline::client::ClientFactory;
+use domain::stelline::client::{
     CurrStepValue, PerClientAddressClientFactory, QueryTailoredClientFactory,
 };
-use net::stelline::parse_stelline;
-use net::stelline::parse_stelline::parse_file;
-use net::stelline::parse_stelline::Config;
-use net::stelline::parse_stelline::Matches;
+use domain::stelline::parse_stelline;
+use domain::stelline::parse_stelline::parse_file;
+use domain::stelline::parse_stelline::Config;
+use domain::stelline::parse_stelline::Matches;
 
 //----------- Tests ----------------------------------------------------------
 
@@ -197,7 +197,7 @@ where
     if config.cookies.enabled {
         #[cfg(feature = "siphasher")]
         if let Some(secret) = config.cookies.secret {
-            let secret = hex::decode(secret).unwrap();
+            let secret = base16::decode_vec(secret).unwrap();
             let secret = <[u8; 16]>::try_from(secret).unwrap();
             let processor = CookiesMiddlewareProcessor::new(secret);
             let processor = processor

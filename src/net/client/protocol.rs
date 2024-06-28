@@ -2,17 +2,12 @@
 
 use core::future::Future;
 use core::pin::Pin;
-use pin_project_lite::pin_project;
 use std::boxed::Box;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::ReadBuf;
 use tokio::net::{TcpStream, UdpSocket};
-use tokio_rustls::client::TlsStream;
-use tokio_rustls::rustls::{ClientConfig, ServerName};
-use tokio_rustls::TlsConnector;
 
 /// How many times do we try a new random port if we get ‘address in use.’
 const RETRY_RANDOM_PORT: usize = 10;
@@ -71,25 +66,30 @@ impl AsyncConnect for TcpConnect {
 //------------ TlsConnect -----------------------------------------------------
 
 /// Create new TLS connections
+#[cfg(feature = "tokio-rustls")]
 #[derive(Clone, Debug)]
 pub struct TlsConnect {
     /// Configuration for setting up a TLS connection.
-    client_config: Arc<ClientConfig>,
+    client_config: std::sync::Arc<tokio_rustls::rustls::ClientConfig>,
 
     /// Server name for certificate verification.
-    server_name: ServerName,
+    server_name: tokio_rustls::rustls::pki_types::ServerName<'static>,
 
     /// Remote address to connect to.
     addr: SocketAddr,
 }
 
+#[cfg(feature = "tokio-rustls")]
 impl TlsConnect {
     /// Function to create a new TLS connection stream
-    pub fn new(
-        client_config: impl Into<Arc<ClientConfig>>,
-        server_name: ServerName,
+    pub fn new<Conf>(
+        client_config: Conf,
+        server_name: tokio_rustls::rustls::pki_types::ServerName<'static>,
         addr: SocketAddr,
-    ) -> Self {
+    ) -> Self
+    where
+        Conf: Into<std::sync::Arc<tokio_rustls::rustls::ClientConfig>>,
+    {
         Self {
             client_config: client_config.into(),
             server_name,
@@ -98,8 +98,9 @@ impl TlsConnect {
     }
 }
 
+#[cfg(feature = "tokio-rustls")]
 impl AsyncConnect for TlsConnect {
-    type Connection = TlsStream<TcpStream>;
+    type Connection = tokio_rustls::client::TlsStream<TcpStream>;
     type Fut = Pin<
         Box<
             dyn Future<Output = Result<Self::Connection, std::io::Error>>
@@ -109,7 +110,8 @@ impl AsyncConnect for TlsConnect {
     >;
 
     fn connect(&self) -> Self::Fut {
-        let tls_connection = TlsConnector::from(self.client_config.clone());
+        let tls_connection =
+            tokio_rustls::TlsConnector::from(self.client_config.clone());
         let server_name = self.server_name.clone();
         let addr = self.addr;
         Box::pin(async move {
@@ -219,24 +221,25 @@ impl<R: AsyncDgramRecv> AsyncDgramRecvEx for R {}
 
 //------------ DgramRecv -----------------------------------------------------
 
-pin_project! {
-    /// Return value of recv. This captures the future for recv.
-    pub struct DgramRecv<'a, R: ?Sized> {
-        receiver: &'a R,
-        buf: &'a mut [u8],
-    }
+/// Return value of recv. This captures the future for recv.
+pub struct DgramRecv<'a, R: ?Sized> {
+    /// The receiver of the datagram.
+    receiver: &'a R,
+
+    /// Buffer to store the datagram.
+    buf: &'a mut [u8],
 }
 
 impl<R: AsyncDgramRecv + Unpin> Future for DgramRecv<'_, R> {
     type Output = io::Result<usize>;
 
     fn poll(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<usize>> {
-        let me = self.project();
-        let mut buf = ReadBuf::new(me.buf);
-        match Pin::new(me.receiver).poll_recv(cx, &mut buf) {
+        let receiver = self.receiver;
+        let mut buf = ReadBuf::new(self.buf);
+        match Pin::new(receiver).poll_recv(cx, &mut buf) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(res) => {
                 if let Err(err) = res {

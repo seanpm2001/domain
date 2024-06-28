@@ -23,6 +23,10 @@
 //!   as upstream transports.
 //! * [cache] This is a simple message cache provided as a pass through
 //!   transport. The cache works with any of the other transports.
+#![cfg_attr(feature = "unstable-validator", doc = "* [validator]:")]
+#![cfg_attr(not(feature = "unstable-validator",), doc = "* validator:")]
+//!   This is a DNSSEC validator provided as a pass through transport.
+//!   The validator works with any of the other transports.
 //!
 //! Sending a request and receiving the reply consists of four steps:
 //! 1) Creating a request message,
@@ -145,7 +149,7 @@
 //!
 //! The current implementaton has the following limitations:
 //! * The [dgram] transport does not support DNS Cookies
-//!   ([`RFC 7873`](https://www.rfc-editor.org/info/rfc7873)
+//!   ([`RFC 7873`](https://tools.ietf.org/html/rfc7873)
 //!   Domain Name System (DNS) Cookies).
 //! * The [multi_stream] transport does not support timeouts or other limits on
 //!   the number of attempts to open a connection. The caller has to
@@ -153,11 +157,11 @@
 //! * The [cache] transport does not support:
 //!   * prefetching. In this context, prefetching means updating a cache entry
 //!     before it expires.
-//!   * [RFC 8767](https://www.rfc-editor.org/info/rfc8767)
+//!   * [RFC 8767](https://tools.ietf.org/html/rfc8767)
 //!     (Serving Stale Data to Improve DNS Resiliency)
-//!   * [RFC 7871](https://www.rfc-editor.org/info/rfc7871)
+//!   * [RFC 7871](https://tools.ietf.org/html/rfc7871)
 //!     (Client Subnet in DNS Queries)
-//!   * [RFC 8198](https://www.rfc-editor.org/info/rfc8198)
+//!   * [RFC 8198](https://tools.ietf.org/html/rfc8198)
 //!     (Aggressive Use of DNSSEC-Validated Cache)
 
 //! # Example with various transport connections
@@ -168,6 +172,7 @@
 #![cfg(feature = "unstable-client-transport")]
 #![cfg_attr(docsrs, doc(cfg(feature = "unstable-client-transport")))]
 #![warn(missing_docs)]
+#![warn(clippy::missing_docs_in_private_items)]
 
 pub mod cache;
 pub mod dgram;
@@ -177,3 +182,6 @@ pub mod protocol;
 pub mod redundant;
 pub mod request;
 pub mod stream;
+#[cfg(feature = "unstable-validator")]
+pub mod validator;
+pub mod validator_test;

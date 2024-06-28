@@ -1,8 +1,5 @@
 //! A client transport using a stream socket.
 
-#![warn(missing_docs)]
-#![warn(clippy::missing_docs_in_private_items)]
-
 // RFC 7766 describes DNS over TCP
 // RFC 7828 describes the edns-tcp-keepalive option
 
@@ -139,7 +136,7 @@ impl<Req: ComposeRequest + 'static> Connection<Req> {
     /// Start a DNS request.
     ///
     /// This function takes a precomposed message as a parameter and
-    /// returns a [ReqRepl] object wrapped in a [Result].
+    /// returns a [`Message`] object wrapped in a [`Result`].
     async fn handle_request_impl(
         self,
         msg: Req,
@@ -236,20 +233,20 @@ pub struct Transport<Stream, Req> {
     receiver: mpsc::Receiver<ChanReq<Req>>,
 }
 
-/// A message from a `Request` to start a new request.
+/// A message from a [`Request`] to start a new request.
 #[derive(Debug)]
 struct ChanReq<Req> {
     /// DNS request message
     msg: Req,
 
-    /// Sender to send result back to [Request]
+    /// Sender to send result back to [`Request`]
     sender: ReplySender,
 }
 
 /// This is the type of sender in [ChanReq].
 type ReplySender = oneshot::Sender<ChanResp>;
 
-/// A message back to `Request` returning a response.
+/// A message back to [`Request`] returning a response.
 type ChanResp = Result<Message<Bytes>, Error>;
 
 /// Internal datastructure of [Transport::run] to keep track of
@@ -273,7 +270,7 @@ struct Status {
     idle_timeout: Option<Duration>,
 }
 
-/// Status of the connection. Used in [Status].
+/// Status of the connection. Used in [`Status`].
 enum ConnState {
     /// The connection is in this state from the start and when at least
     /// one active DNS request is present.
@@ -750,7 +747,7 @@ struct Queries<T> {
     /// The number of elements in `vec` that are not None.
     count: usize,
 
-    /// Index in `vec? where to look for a space for a new query.
+    /// Index in `vec` where to look for a space for a new query.
     curr: usize,
 
     /// Vector of senders to forward a DNS reply message (or error) to.

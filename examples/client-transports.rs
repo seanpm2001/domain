@@ -15,7 +15,7 @@ use std::str::FromStr;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tokio_rustls::rustls::{ClientConfig, OwnedTrustAnchor, RootCertStore};
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
 #[tokio::main]
 async fn main() {
@@ -29,6 +29,7 @@ async fn main() {
     // `RequestMessage` manually.
     let mut msg = MessageBuilder::new_vec();
     msg.header_mut().set_rd(true);
+    msg.header_mut().set_ad(true);
     let mut msg = msg.question();
     msg.push((Name::vec_from_str("example.com").unwrap(), Rtype::AAAA))
         .unwrap();
@@ -58,7 +59,7 @@ async fn main() {
     let (udptcp_conn, transport) = dgram_stream::Connection::with_config(
         udp_connect,
         tcp_connect,
-        dgram_stream_config,
+        dgram_stream_config.clone(),
     );
 
     // Start the run function in a separate task. The run function will
@@ -104,6 +105,9 @@ async fn main() {
     let reply = request.get_response().await;
     println!("Cached reply: {reply:?}");
 
+    #[cfg(feature = "unstable-validator")]
+    do_validator(udptcp_conn.clone(), req.clone()).await;
+
     // Create a new TCP connections object. Pass the destination address and
     // port as parameter.
     let tcp_connect = TcpConnect::new(server_addr);
@@ -135,20 +139,12 @@ async fn main() {
     drop(request);
 
     // Some TLS boiler plate for the root certificates.
-    let mut root_store = RootCertStore::empty();
-    root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(
-        |ta| {
-            OwnedTrustAnchor::from_subject_spki_name_constraints(
-                ta.subject,
-                ta.spki,
-                ta.name_constraints,
-            )
-        },
-    ));
+    let root_store = RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.into(),
+    };
 
     // TLS config
     let client_config = ClientConfig::builder()
-        .with_safe_defaults()
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
@@ -252,4 +248,38 @@ async fn main() {
     println!("TCP reply: {reply:?}");
 
     drop(tcp);
+}
+
+#[cfg(feature = "unstable-validator")]
+async fn do_validator<Octs, SR>(conn: SR, req: RequestMessage<Octs>)
+where
+    Octs: AsRef<[u8]>
+        + Clone
+        + std::fmt::Debug
+        + domain::dep::octseq::Octets
+        + domain::dep::octseq::OctetsFrom<Vec<u8>>
+        + Send
+        + Sync
+        + 'static,
+    <Octs as domain::dep::octseq::OctetsFrom<Vec<u8>>>::Error:
+        std::fmt::Debug,
+    SR: Clone + SendRequest<RequestMessage<Octs>> + Send + Sync + 'static,
+{
+    // Create a validating transport
+    let anchor_file = std::fs::File::open("examples/root.key").unwrap();
+    let ta =
+        domain::validator::anchor::TrustAnchors::from_reader(anchor_file)
+            .unwrap();
+    let vc = std::sync::Arc::new(
+        domain::validator::context::ValidationContext::new(ta, conn.clone()),
+    );
+    let val_conn = domain::net::client::validator::Connection::new(conn, vc);
+
+    // Send a query message.
+    let mut request = val_conn.send_request(req);
+
+    // Get the reply
+    println!("Wating for Validator reply");
+    let reply = request.get_response().await;
+    println!("Validator reply: {:?}", reply);
 }

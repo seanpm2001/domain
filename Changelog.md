@@ -4,11 +4,90 @@
 
 Breaking changes
 
+New
+
+Bug fixes
+
+* Fixed a mistake in the tsig module while calculating the start of
+  the TSIG record when there were other records in the additional section,
+  causing the TSIG code to fail if OPT records were in use. ([#333])
+
+Unstable features
+
+* `unstable-client-transport`: Fixed an issue with slow responses in the
+  `multi_stream` transport by not waiting in the first iteration if an
+  underlying stream reports its connection being closed. ([#338])
+* New unstable feature `unstable-validator` that adds a DNSSEC validator.
+  ([#328])
+
+Other changes
+
+[#328]: https://github.com/NLnetLabs/domain/pull/328
+[#333]: https://github.com/NLnetLabs/domain/pull/333
+[#338]: https://github.com/NLnetLabs/domain/pull/338
+
+## 0.10.1
+
+Release 2024-06-03.
+
+New
+
+* Allow AllRecordData’s parsing impls to accept an unsized [u8] as the
+  source octets. ([#310] by [@xofyarg])
+* Made `sign::records::FamilyName` public. ([#312] by [@achow101])
+* Added an impl of `FromStr` for `Question`. ([#317])
+
+Bug fixes
+
+* Accept an empty record type bitmap when scanning NSEC/NSEC3 data.
+  ([#310] by [@xofyarg])
+* Fix serialization of ProtoRrsig to conform with RFC 4034. ([#313 by
+  [@achow101])
+* Add `?Sized` bounds to `Message::is_answer` and `ParsedRecord::to_record`.
+  ([#318] by [@xofyarg], [#325] by [@hunts])
+* Bring back `MessageBuilder::as_target`. ([#318] by [@xofyarg])
+* Bring back `impl FreezeBuilder for StaticCompressor`. ([#318] by [@xofyarg])
+* `sign::records::RecordsIter::skip_before` now stops at the first name in
+  zone even if the apex itself doesn’t appear. ([#314] by [@achow101])
+* Fix a counting error in `SliceLabelsIter::next` that broke compression
+  via `StaticCompressor`. ([#321] by [@hunts])
+
+Unstable features
+
+* New unstable feature `unstable-stelline` for the Stelline testing
+  framework as a “normal” module of _domain._ ([#315])
+* Renamed the domain name types in `zonetree` from `Dname` to `Name`.
+  ([#308])
+
+Other changes
+
+* The minimum Rust version is now 1.78. ([#320])
+
+[#308]: https://github.com/NLnetLabs/domain/pull/308
+[#310]: https://github.com/NLnetLabs/domain/pull/310
+[#312]: https://github.com/NLnetLabs/domain/pull/312
+[#314]: https://github.com/NLnetLabs/domain/pull/314
+[#315]: https://github.com/NLnetLabs/domain/pull/315
+[#317]: https://github.com/NLnetLabs/domain/pull/317
+[#318]: https://github.com/NLnetLabs/domain/pull/318
+[#320]: https://github.com/NLnetLabs/domain/pull/320
+[#321]: https://github.com/NLnetLabs/domain/pull/321
+[#325]: https://github.com/NLnetLabs/domain/pull/325
+[@achow101]: https://github.com/achow101
+[@hunts]: https://github.com/hunts
+[@xofyarg]: https://github.com/xofyarg
+
+## 0.10.0
+
+Released 2024-04-30.
+
+Breaking changes
+
 * All types and functions referring to domain names have been changed from
   using the term “dname” to just “name.” For instance, `Dname` has become
   `Name`, `ToDname` has become `ToName`, and `ToDname::to_dname` has become
   `ToName::to_name`. ([#290])
-* The `ToDname` and `ToRelativeDname` traits have been changed to have a
+* The `ToName` and `ToRelativeName` traits have been changed to have a
   pair of methods a la `try_to_name` and `to_name` for octets builders
   with limited and unlimited buffers, reflecting the pattern used
   elsewhere. ([#285])
@@ -47,6 +126,7 @@ Breaking changes
 * Split RRSIG timestamp handling from `Serial` into a new type
   `rdata::dnssec::Timestamp`. ([#294])
 * Upgraded `octseq` to 0.5. ([#257])
+* The minimum Rust version is now 1.70. ([#304])
 
 New
 
@@ -79,22 +159,19 @@ Bug fixes
 
 Unstable features
 
-* Add the module `net::client` with experimental support for client
+* Added the module `net::client` with experimental support for client
   message transport, i.e., sending of requests and receiving responses
   as well as caching of responses.
   This is gated by the `unstable-client-transport` feature. ([#215],[#275])
-* Add the module `net::server` with experimental support for server
+* Added the module `net::server` with experimental support for server
   transports, processing requests through a middleware chain and a service
   trait.
   This is gated by the `unstable-server-transport` feature. ([#274])
-* Add the module `zonetree` providing basic traits representing a
+* Added the module `zonetree` providing basic traits representing a
   collection of zones and their data. The `zonetree::in_memory` module 
-  provides an in-memory implementation. The `zonefile::parsed` module
+  provides an in-memory implementation. The `zonetree::parsed` module
   provides a way to classify RRsets before inserting them into a tree.
   This is gated by the `unstable-zonetree` feature. ([#286])
-  
-
-Other changes
 
 
 [#215]: https://github.com/NLnetLabs/domain/pull/215
@@ -123,6 +200,7 @@ Other changes
 [#298]: https://github.com/NLnetLabs/domain/pull/298
 [#299]: https://github.com/NLnetLabs/domain/pull/299
 [#300]: https://github.com/NLnetLabs/domain/pull/300
+[#304]: https://github.com/NLnetLabs/domain/pull/304
 [@torin-carey]: https://github.com/torin-carey
 [@hunts]: https://github.com/hunts
 

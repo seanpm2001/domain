@@ -1,18 +1,20 @@
 //! Convenient representations of DNS messages.
 
 use super::{AllOptData, Question, Record};
-use crate::base;
-use crate::base::header::{Header, HeaderCounts};
+use crate::base::header::Header;
+use crate::base::iana::OptRcode;
 use crate::base::message;
+use crate::base::message_builder::PushError;
 use crate::base::name::FlattenInto;
-use crate::base::opt::{ComposeOptData, OptHeader, OptData, OptRecord};
-use crate::base::wire::{Compose, Composer, ParseError};
+use crate::base::opt::OptRecord;
+use crate::base::wire::{Composer, ParseError};
+use crate::base::{self, MessageBuilder};
 use crate::rdata::AllRecordData;
 use bytes::Bytes;
 use octseq::{Octets, OctetsFrom, OctetsInto};
 use std::convert::Infallible;
-use std::{borrow, error, fmt, ops, slice, vec};
 use std::vec::Vec;
+use std::{borrow, ops, slice, vec};
 
 //------------ Message -------------------------------------------------------
 
@@ -143,35 +145,64 @@ impl Message {
     }
 
     /// Creates a base message.
-    pub fn compose<Target: Composer + ?Sized>(
+    pub fn compose<Target: Composer>(
         &self,
-        target: &mut Target,
-    ) -> Result<(), ComposeError<Target::AppendError>> {
+        target: Target,
+    ) -> Result<Target, PushError> {
         // Check that all the sections are small enough to fit in a message
+        // The message builder will still complain if we don't check this, but
+        // it's much faster to check here than to first append u16::MAX
+        // elements.
         if self.question.len() > MAX_SECTION_LEN
             || self.answer.len() > MAX_SECTION_LEN
             || self.authority.len() > MAX_SECTION_LEN
             || self.additional.len() > MAX_SECTION_LEN - 1
         {
-            return Err(ComposeError::Exhausted(()));
+            return Err(PushError::CountOverflow);
         }
 
-        target.append_slice(self.header.as_slice())?;
-        target.append_slice(
-            HeaderCounts::from_counts(
-                self.question.len_u16(),
-                self.answer.len_u16(),
-                self.authority.len_u16(),
-                self.additional.len_u16() + 1,
-            )
-            .as_slice(),
-        )?;
-        self.question.compose(target)?;
-        self.answer.compose(target)?;
-        self.authority.compose(target)?;
-        self.additional.compose(target)?;
-        self.opt.compose(target)?;
-        Ok(())
+        let mut builder = MessageBuilder::from_target(target)
+            .map_err(|_| PushError::ShortBuf)?;
+
+        *builder.header_mut() = self.header;
+
+        let mut builder = builder.question();
+        for q in &self.question {
+            builder.push(q)?;
+        }
+
+        let mut builder = builder.answer();
+        for a in &self.answer {
+            builder.push(a)?;
+        }
+
+        let mut builder = builder.authority();
+        for a in &self.authority {
+            builder.push(a)?;
+        }
+
+        let mut builder = builder.additional();
+        for a in &self.additional {
+            builder.push(a)?;
+        }
+
+        builder.opt(|builder| {
+            let opt = &self.opt;
+            builder.set_udp_payload_size(opt.udp_payload_size);
+            builder.set_rcode(OptRcode::from_parts(
+                self.header.rcode(),
+                opt.ext_rcode,
+            ));
+            builder.set_version(opt.version);
+            builder.set_dnssec_ok(opt.dnssec_ok);
+
+            for d in &opt.data {
+                builder.push(d)?;
+            }
+            Ok(())
+        })?;
+
+        Ok(builder.finish())
     }
 }
 
@@ -192,45 +223,47 @@ pub struct Opt {
     /// The EDNS flags.
     dnssec_ok: bool,
 
-    rdlen: u16,
-
     data: Vec<AllOptData>,
+}
+
+impl Opt {
+    pub fn udp_payload_size(&self) -> u16 {
+        self.udp_payload_size
+    }
+
+    pub fn set_udp_payload_size(&mut self, size: u16) {
+        self.udp_payload_size = size;
+    }
+
+    pub fn ext_rcode(&self) -> u8 {
+        self.ext_rcode
+    }
+
+    pub fn set_ext_rcode(&mut self, rcode: u8) {
+        self.ext_rcode = rcode;
+    }
+
+    pub fn version(&self) -> u8 {
+        self.version
+    }
+
+    pub fn set_version(&mut self, version: u8) {
+        self.version = version;
+    }
 }
 
 impl Opt {
     fn from_base(base: OptRecord<Bytes>) -> Result<Self, ParseError> {
         let mut data = Vec::new();
-        let mut rdlen = 0;
         for item in base.opt().iter_all() {
-            let item = item?;
-            rdlen += item.compose_len();
-            data.push(item);
+            data.push(item?);
         }
         Ok(Opt {
             udp_payload_size: base.udp_payload_size(),
             ext_rcode: base.ext_rcode(),
             version: base.version(),
             dnssec_ok: base.dnssec_ok(),
-            rdlen,
             data,
-        })
-    }
-
-    fn compose<Target: Composer + ?Sized>(
-        &self,
-        target: &mut Target,
-    ) -> Result<(), Target::AppendError> {
-        let mut header = OptHeader::default();
-        header.set_udp_payload_size(self.udp_payload_size);
-        header.set_ext_rcode(self.ext_rcode);
-        header.set_version(self.version);
-        header.set_dnssec_ok(self.dnssec_ok);
-        target.append_slice(header.as_slice())?;
-        self.rdlen.compose(target)?;
-        self.data.iter().try_for_each(|data| {
-            data.code().compose(target)?;
-            data.compose_len().compose(target)?;
-            data.compose_option(target)
         })
     }
 }
@@ -239,10 +272,8 @@ impl Opt {
 
 /// A collection of elements of one of the message sections.
 ///
-/// This type behaves mostly like `Vec<T>`. However, since sections are
-/// limited to at most `N` elements, all methods that add additional
-/// elements to the section fail rather than panic if the section runs out of
-/// space.
+/// This type behaves mostly like `Vec<T>`. It is a separate type to allow for
+/// extension methods.
 #[derive(Clone, Hash, Eq, Ord, PartialEq, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Section<T> {
@@ -287,15 +318,6 @@ impl Section<Question> {
         }
         Ok(Self::from_vec(vec))
     }
-
-    fn compose<Target: Composer + ?Sized>(
-        &self,
-        target: &mut Target,
-    ) -> Result<(), Target::AppendError> {
-        self.elements
-            .iter()
-            .try_for_each(|elem| elem.compose(target))
-    }
 }
 
 impl Section<Record> {
@@ -332,15 +354,6 @@ impl Section<Record> {
             }
         }
         Ok((opt.unwrap_or_default(), Self::from_vec(vec)))
-    }
-
-    fn compose<Target: Composer + ?Sized>(
-        &self,
-        target: &mut Target,
-    ) -> Result<(), Target::AppendError> {
-        self.elements
-            .iter()
-            .try_for_each(|elem| elem.compose(target))
     }
 }
 
@@ -702,33 +715,3 @@ impl<'a, T> IntoIterator for &'a mut Section<T> {
 /// This is u16::MAX, but we need it as a usize. Because `From::from` isn’t
 /// const, we need to use `as` here.
 const MAX_SECTION_LEN: usize = u16::MAX as usize;
-
-//============ Errors ========================================================
-
-//------------ ComposeError --------------------------------------------------
-
-/// A section’s space is exhausted.
-#[derive(Clone, Copy, Debug)]
-pub enum ComposeError<A> {
-    Exhausted(()),
-    AppendError(A),
-}
-
-impl<A: fmt::Display> fmt::Display for ComposeError<A> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            ComposeError::Exhausted(()) => {
-                f.write_str("section space exhausted")
-            }
-            ComposeError::AppendError(e) => e.fmt(f),
-        }
-    }
-}
-
-impl<A: fmt::Debug + fmt::Display> error::Error for ComposeError<A> {}
-
-impl<A> From<A> for ComposeError<A> {
-    fn from(value: A) -> Self {
-        ComposeError::AppendError(value)
-    }
-}

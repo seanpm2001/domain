@@ -2,7 +2,7 @@
     not(feature = "unstable-server-transport"),
     doc = " The `unstable-server-transport` feature is necessary to enable this module."
 )]
-#![warn(missing_docs)]
+// #![warn(missing_docs)]
 #![warn(clippy::missing_docs_in_private_items)]
 //! Receiving requests and sending responses.
 //!
@@ -212,14 +212,17 @@
 mod connection;
 pub use connection::Config as ConnectionConfig;
 
+pub mod adapter;
 pub mod buf;
 pub mod dgram;
 pub mod error;
 pub mod message;
 pub mod metrics;
 pub mod middleware;
+pub mod query_router;
 pub mod service;
 pub mod sock;
+pub mod sr_service;
 pub mod stream;
 pub mod util;
 

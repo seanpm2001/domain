@@ -331,7 +331,10 @@ fn mk_client_factory(
                     let key = entry.key_name.as_ref().and_then(|key_name| {
                         key_store.get_key(&key_name, Algorithm::Sha256)
                     });
-                    let client = dgram::Connection::new(connect);
+                    let mut config = dgram::Config::new();
+                    config.set_max_retries(0);
+                    let client =
+                        dgram::Connection::with_config(connect, config);
                     // While AXFR is TCP only, IXFR can also be done over UDP.
                     let client = xfr::Connection::new(None, client);
                     Box::new(tsig::Connection::new(key, client))

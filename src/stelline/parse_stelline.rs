@@ -573,6 +573,7 @@ pub struct Matches {
     pub server_cookie: bool,
     pub edns_data: bool,
     pub mock_client: bool,
+    pub conn_closed: bool,
 }
 
 fn parse_match(mut tokens: LineTokens<'_>) -> Matches {
@@ -626,6 +627,8 @@ fn parse_match(mut tokens: LineTokens<'_>) -> Matches {
             matches.edns_data = true;
         } else if token == "MOCK_CLIENT" {
             matches.mock_client = true;
+        } else if token == "CONNECTION_CLOSED" {
+            matches.conn_closed = true;
         } else {
             println!("should handle match {token:?}");
             todo!();

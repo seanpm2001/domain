@@ -448,7 +448,21 @@ pub async fn do_client<'a, T: ClientFactory>(
                             "Awaiting answer {}/{num_expected_answers}...",
                             idx + 1
                         );
-                        let resp = send_request.get_response().await?;
+                        let resp = match send_request.get_response().await {
+                            Err(
+                                Error::StreamReceiveError
+                                | Error::ConnectionClosed,
+                            ) if entry
+                                .matches
+                                .as_ref()
+                                .map(|v| v.conn_closed)
+                                == Some(true) =>
+                            {
+                                trace!("Connection terminated as expected");
+                                break;
+                            }
+                            other => other,
+                        }?;
                         trace!("Received answer.");
                         trace!(?resp);
                         if !match_multi_msg(entry, idx, &resp, true) {

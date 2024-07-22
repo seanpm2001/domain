@@ -219,7 +219,7 @@ pub mod error;
 pub mod message;
 pub mod metrics;
 pub mod middleware;
-pub mod query_router;
+pub mod qname_router;
 pub mod service;
 pub mod sock;
 pub mod sr_service;

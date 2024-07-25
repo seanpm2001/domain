@@ -459,9 +459,8 @@ pub async fn do_client<'a, T: ClientFactory>(
                                 send_request.get_response(),
                             )
                             .await
-                            .map_err(|_| {
-                                StellineErrorCause::AnswerTimedOut
-                            })? {
+                            .map_err(|_| StellineErrorCause::AnswerTimedOut)?
+                            {
                                 Err(
                                     Error::StreamReceiveError
                                     | Error::ConnectionClosed,
@@ -471,7 +470,9 @@ pub async fn do_client<'a, T: ClientFactory>(
                                     .map(|v| v.conn_closed)
                                     == Some(true) =>
                                 {
-                                    trace!("Connection terminated as expected");
+                                    trace!(
+                                        "Connection terminated as expected"
+                                    );
                                     break;
                                 }
                                 other => other,
@@ -527,9 +528,8 @@ pub async fn do_client<'a, T: ClientFactory>(
                                 send_request.get_response(),
                             )
                             .await
-                            .map_err(|_| {
-                                StellineErrorCause::AnswerTimedOut
-                            })? {
+                            .map_err(|_| StellineErrorCause::AnswerTimedOut)?
+                            {
                                 Err(
                                     Error::StreamReceiveError
                                     | Error::ConnectionClosed,
@@ -539,7 +539,9 @@ pub async fn do_client<'a, T: ClientFactory>(
                                     .map(|v| v.conn_closed)
                                     == Some(true) =>
                                 {
-                                    trace!("Connection terminated as expected");
+                                    trace!(
+                                        "Connection terminated as expected"
+                                    );
                                     break;
                                 }
                                 other => other,

@@ -20,6 +20,8 @@ use crate::base::opt::{ComposeOptData, LongOptData, OptRecord};
 use crate::base::wire::{Composer, ParseError};
 use crate::base::{Header, Message, ParsedName, Rtype};
 use crate::rdata::AllRecordData;
+
+#[cfg(feature = "tsig")]
 use crate::tsig;
 
 //------------ ComposeRequest ------------------------------------------------
@@ -366,7 +368,7 @@ pub enum Error {
     /// Zone write failed.
     ZoneWrite,
 
-    #[cfg(feature = "unstable-server-transport")]
+    #[cfg(feature = "tsig")]
     /// TSIG authentication failed.
     Authentication(tsig::ValidationError),
 
@@ -455,7 +457,7 @@ impl fmt::Display for Error {
             #[cfg(feature = "unstable-server-transport")]
             Error::ZoneWrite => write!(f, "zone write error"),
 
-            #[cfg(feature = "unstable-server-transport")]
+            #[cfg(feature = "tsig")]
             Error::Authentication(err) => fmt::Display::fmt(err, f),
 
             #[cfg(feature = "unstable-validator")]
@@ -499,7 +501,7 @@ impl error::Error for Error {
             #[cfg(feature = "unstable-server-transport")]
             Error::ZoneWrite => None,
 
-            #[cfg(feature = "unstable-server-transport")]
+            #[cfg(feature = "tsig")]
             Error::Authentication(err) => Some(err),
 
             #[cfg(feature = "unstable-validator")]

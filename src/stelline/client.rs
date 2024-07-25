@@ -70,6 +70,7 @@ pub enum StellineErrorCause {
     MissingResponse,
     MissingStepEntry,
     MissingClient,
+    AnswerTimedOut,
 }
 
 impl From<Error> for StellineErrorCause {
@@ -95,6 +96,9 @@ impl std::fmt::Display for StellineErrorCause {
             }
             StellineErrorCause::MissingStepEntry => {
                 f.write_str("Missing step entry")
+            }
+            StellineErrorCause::AnswerTimedOut => {
+                f.write_str("Timed out waiting for answer")
             }
         }
     }
@@ -428,12 +432,6 @@ pub async fn do_client<'a, T: ClientFactory>(
                         return Err(StellineErrorCause::MissingResponse);
                     };
 
-                    let num_expected_answers = entry
-                        .sections
-                        .as_ref()
-                        .map(|section| section.answer.len())
-                        .unwrap_or_default();
-
                     // NOTE: Calling .get_response() on a non-streaming
                     // request will only work once at the time of writing, the
                     // dgram client implementation will fail if called a
@@ -443,35 +441,123 @@ pub async fn do_client<'a, T: ClientFactory>(
                     // implementations need to be safe to call for a
                     // subsequent response.
 
-                    for idx in 0..num_expected_answers {
-                        trace!(
-                            "Awaiting answer {}/{num_expected_answers}...",
-                            idx + 1
-                        );
-                        let resp = match send_request.get_response().await {
-                            Err(
-                                Error::StreamReceiveError
-                                | Error::ConnectionClosed,
-                            ) if entry
-                                .matches
-                                .as_ref()
-                                .map(|v| v.conn_closed)
-                                == Some(true) =>
-                            {
-                                trace!("Connection terminated as expected");
-                                break;
-                            }
-                            other => other,
-                        }?;
-                        trace!("Received answer.");
-                        trace!(?resp);
-                        if !match_multi_msg(entry, idx, &resp, true) {
-                            return Err(StellineErrorCause::MismatchedAnswer);
-                        }
-                    }
+                    if entry
+                        .matches
+                        .as_ref()
+                        .map(|v| v.extra_packets)
+                        .unwrap_or_default()
+                    {
+                        // This assumes that the client used for the test knows
+                        // how to detect the last response in a set of
+                        // responses, e.g. the xfr client knows how to detect
+                        // the last response in an AXFR/IXFR response set.
+                        trace!("Awaiting an unknown number of answers");
+                        let mut entry = entry.clone();
+                        loop {
+                            let resp = match tokio::time::timeout(
+                                Duration::from_secs(3),
+                                send_request.get_response(),
+                            )
+                            .await
+                            .map_err(|_| {
+                                StellineErrorCause::AnswerTimedOut
+                            })? {
+                                Err(
+                                    Error::StreamReceiveError
+                                    | Error::ConnectionClosed,
+                                ) if entry
+                                    .matches
+                                    .as_ref()
+                                    .map(|v| v.conn_closed)
+                                    == Some(true) =>
+                                {
+                                    trace!("Connection terminated as expected");
+                                    break;
+                                }
+                                other => other,
+                            }?;
 
-                    if num_expected_answers > 1 {
-                        send_request.stream_complete().unwrap();
+                            trace!("Received answer.");
+                            trace!(?resp);
+
+                            let mut out_entry = Some(vec![]);
+                            match_multi_msg(
+                                &entry,
+                                0,
+                                &resp,
+                                true,
+                                &mut out_entry,
+                            );
+                            let num_rrs_remaining_after = out_entry
+                                .as_ref()
+                                .map(|entries| entries.len())
+                                .unwrap_or_default();
+                            if let Some(section) = &mut entry.sections {
+                                section.answer[0] = out_entry.unwrap();
+                            }
+                            trace!("Answer RRs remaining = {num_rrs_remaining_after}");
+
+                            if send_request.is_stream_complete() {
+                                trace!("Stream complete");
+                                if !entry.sections.as_ref().unwrap().answer[0]
+                                    .is_empty()
+                                {
+                                    return Err(
+                                        StellineErrorCause::MismatchedAnswer,
+                                    );
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        let num_expected_answers = entry
+                            .sections
+                            .as_ref()
+                            .map(|section| section.answer.len())
+                            .unwrap_or_default();
+
+                        for idx in 0..num_expected_answers {
+                            trace!(
+                                "Awaiting answer {}/{num_expected_answers}...",
+                                idx + 1
+                            );
+                            let resp = match tokio::time::timeout(
+                                Duration::from_secs(3),
+                                send_request.get_response(),
+                            )
+                            .await
+                            .map_err(|_| {
+                                StellineErrorCause::AnswerTimedOut
+                            })? {
+                                Err(
+                                    Error::StreamReceiveError
+                                    | Error::ConnectionClosed,
+                                ) if entry
+                                    .matches
+                                    .as_ref()
+                                    .map(|v| v.conn_closed)
+                                    == Some(true) =>
+                                {
+                                    trace!("Connection terminated as expected");
+                                    break;
+                                }
+                                other => other,
+                            }?;
+                            trace!("Received answer.");
+                            trace!(?resp);
+                            if !match_multi_msg(
+                                entry, idx, &resp, true, &mut None,
+                            ) {
+                                return Err(
+                                    StellineErrorCause::MismatchedAnswer,
+                                );
+                            }
+                        }
+
+                        if num_expected_answers > 1 {
+                            send_request.stream_complete().unwrap();
+                        }
                     }
 
                     last_sent_request = None;

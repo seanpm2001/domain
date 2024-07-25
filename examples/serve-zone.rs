@@ -43,7 +43,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use domain::zonecatalog::catalog::{
-    self, Catalog, DefaultConnFactory, TypedZone,
+    self, Catalog, DefaultConnFactory, TypedZone, ZoneLookup,
 };
 use domain::zonecatalog::types::{
     CatalogKeyStore, CompatibilityMode, NotifyConfig, TransportStrategy,
@@ -97,10 +97,12 @@ async fn main() {
     };
 
     // Create a catalog that will handle outbound XFR for zones
-    let cat_config = catalog::Config::new(config.key_store.clone());
+    let cat_config = catalog::Config::<_, DefaultConnFactory>::new(
+        config.key_store.clone(),
+    );
     let catalog = Catalog::new_with_config(cat_config);
     let catalog = Arc::new(catalog);
-    catalog.insert_zone(config.zone).await.unwrap();
+    catalog.insert_zone(config.zone.clone()).await.unwrap();
 
     let max_concurrency =
         std::thread::available_parallelism().unwrap().get() / 2;
@@ -108,15 +110,15 @@ async fn main() {
 
     // Create a service to answer queries for the zone.
     let svc = service_fn(my_service, catalog.clone());
-    let svc: XfrMiddlewareSvc<Vec<u8>, _, Arc<CatalogKeyStore>, _> =
-        XfrMiddlewareSvc::<Vec<u8>, _, _, _>::new(
+    let svc: XfrMiddlewareSvc<Vec<u8>, _, _> =
+        XfrMiddlewareSvc::<Vec<u8>, _, _>::new(
             svc,
             catalog.clone(),
             max_concurrency,
             XfrMode::AxfrAndIxfr,
         );
     let svc =
-        NotifyMiddlewareSvc::<Vec<u8>, _, _, _, _>::new(svc, catalog.clone());
+        NotifyMiddlewareSvc::<Vec<u8>, _, _, _>::new(svc, catalog.clone());
     let svc = CookiesMiddlewareSvc::<Vec<u8>, _, _>::with_random_secret(svc);
     let svc = EdnsMiddlewareSvc::<Vec<u8>, _, _>::new(svc);
     let svc = MandatoryMiddlewareSvc::<Vec<u8>, _, _>::new(svc);
@@ -191,7 +193,7 @@ async fn main() {
 
             if let Ok(report) = catalog_clone
                 .zone_status(
-                    &Name::from_str("example.com").unwrap(),
+                    config.zone.apex_name(),
                     Class::IN,
                 )
                 .await
@@ -224,9 +226,9 @@ async fn main() {
     pending::<()>().await;
 }
 
-fn my_service(
+fn my_service<T: ZoneLookup>(
     request: Request<Vec<u8>>,
-    catalog: Arc<Catalog<Arc<CatalogKeyStore>, DefaultConnFactory>>,
+    catalog: T,
 ) -> ServiceResult<Vec<u8>> {
     let question = request.message().sole_question().unwrap();
     let zones = catalog.zones();
@@ -440,8 +442,8 @@ Options:
   --listen <ip>:<port>:            UDP and TCP address to listen on [default {def_listen_addr}].
   --listen-udp <ip>:<port>:        UDP address to listen on [default {def_listen_addr}].
   --listen-tcp <ip>:<port>:        TCP address to listen on [default {def_listen_addr}].
-  --xfr-src <ip>:<port>:           Accept NOTIFY from <ip> and request XFR from <ip>:<port>.
-  --xfr-dst <ip>:<port>:           Send NOTIFY to <ip>:<port> and accept XFR requests from <ip>.
+  --xfr-src <ip>[:<port>]:         Accept NOTIFY from <ip> and (optional) request XFR from <ip>:<port>.
+  --xfr-dst <ip>[:<port>]:         Accept XFR requests from <ip> and (optional) send NOTIFY to <ip>:<port>.
   --tsig-key <name>:[<alg>]:<key>: E.g. "my key":hmac-sha256:<base64 key data>.
                                    Applies to the next --xfr-src|dst argument.
   --zone-dump-path <path>:         Save received updates to the served zone to this path.
@@ -509,23 +511,33 @@ Options:
 
             "--xfr-src" => {
                 let arg = args.next().ok_or("Error: Missing XFR source")?;
-                let src = SocketAddr::from_str(&arg).map_err(|err| {
-                    format!("Error: Invalid XFR source '{arg}': {err}")
-                })?;
+                let src = SocketAddr::from_str(&arg)
+                    .or(IpAddr::from_str(&arg)
+                        .map(|ip| SocketAddr::new(ip, 0)))
+                    .map_err(|err| {
+                        format!("Error: Invalid XFR src '{arg}': {err}")
+                    })?;
 
                 zone_cfg
                     .allow_notify_from
                     .add_src(src.ip(), notify_cfg.clone());
-                zone_cfg.request_xfr_from.add_dst(src, xfr_cfg.clone());
+                if src.port() != 0 {
+                    zone_cfg.request_xfr_from.add_dst(src, xfr_cfg.clone());
+                }
             }
 
             "--xfr-dst" => {
                 let arg = args.next().ok_or("Error: Missing XFR dest")?;
-                let dst = SocketAddr::from_str(&arg).map_err(|err| {
-                    format!("Error: Invalid XFR dest '{arg}': {err}")
-                })?;
+                let dst = SocketAddr::from_str(&arg)
+                    .or(IpAddr::from_str(&arg)
+                        .map(|ip| SocketAddr::new(ip, 0)))
+                    .map_err(|err| {
+                        format!("Error: Invalid XFR dst '{arg}': {err}")
+                    })?;
 
-                zone_cfg.send_notify_to.add_dst(dst, notify_cfg.clone());
+                if dst.port() != 0 {
+                    zone_cfg.send_notify_to.add_dst(dst, notify_cfg.clone());
+                }
                 zone_cfg.provide_xfr_to.add_src(dst.ip(), xfr_cfg.clone());
             }
 
@@ -609,8 +621,14 @@ Options:
             let reader = inplace::Zonefile::load(&mut zone_bytes).map_err(|err| {
                 format!("Error: Failed to load zone file from '{zone_path}': {err}")
             })?;
-            Zone::try_from(reader)
-                .map_err(|err| format!("Failed to parse zone: {err}"))?
+            Zone::try_from(reader).map_err(|errors| {
+                let mut msg =
+                    format!("Failed to parse zone: {} errors", errors.len());
+                for (name, err) in errors {
+                    msg.push_str(&format!("  {name}: {err}\n"));
+                }
+                msg
+            })?
         }
 
         None => {

@@ -5,6 +5,7 @@ use core::task::{Context, Poll};
 
 use std::boxed::Box;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Display;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::string::ToString;
@@ -136,6 +137,18 @@ pub enum TransportStrategy {
     None,
     Udp,
     Tcp,
+}
+
+//--- Display
+
+impl Display for TransportStrategy {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            TransportStrategy::None => f.write_str("None"),
+            TransportStrategy::Udp => f.write_str("UDP"),
+            TransportStrategy::Tcp => f.write_str("TCP"),
+        }
+    }
 }
 
 //------------ CompatibilityMode ---------------------------------------------
@@ -296,7 +309,7 @@ pub enum ZoneRefreshStatus {
 
 //--- Display
 
-impl std::fmt::Display for ZoneRefreshStatus {
+impl Display for ZoneRefreshStatus {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ZoneRefreshStatus::Refreshing => f.write_str("refreshing"),
@@ -311,7 +324,7 @@ impl std::fmt::Display for ZoneRefreshStatus {
 //------------ ZoneRefreshMetrics --------------------------------------------
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct ZoneRefreshMetrics {
+pub struct ZoneRefreshMetrics {
     pub zone_created_at: Instant,
 
     /// None means never checked
@@ -357,19 +370,19 @@ impl Default for ZoneRefreshMetrics {
 #[derive(Clone, Copy, Debug)]
 pub struct ZoneRefreshState {
     /// SOA REFRESH
-    pub(super) refresh: Ttl,
+    refresh: Ttl,
 
     /// SOA RETRY
-    pub(super) retry: Ttl,
+    retry: Ttl,
 
     /// SOA EXPIRE
-    pub(super) expire: Ttl,
+    expire: Ttl,
 
     /// Refresh status
-    pub(super) status: ZoneRefreshStatus,
+    status: ZoneRefreshStatus,
 
     /// Refresh metrics
-    pub(super) metrics: ZoneRefreshMetrics,
+    metrics: ZoneRefreshMetrics,
 }
 
 impl ZoneRefreshState {
@@ -381,6 +394,67 @@ impl ZoneRefreshState {
             metrics: Default::default(),
             status: Default::default(),
         }
+    }
+
+    pub fn refresh(&self) -> Ttl {
+        self.refresh
+    }
+
+    pub fn retry(&self) -> Ttl {
+        self.retry
+    }
+
+    pub fn expire(&self) -> Ttl {
+        self.expire
+    }
+
+    pub fn status(&self) -> ZoneRefreshStatus {
+        self.status
+    }
+
+    pub fn set_status(&mut self, status: ZoneRefreshStatus) {
+        trace!("Refresh status for zone changed to: {status}");
+        self.status = status;
+    }
+
+    pub fn metrics(&self) -> ZoneRefreshMetrics {
+        self.metrics
+    }
+
+    pub fn metrics_mut(&mut self) -> &mut ZoneRefreshMetrics {
+        &mut self.metrics
+    }
+
+    pub fn is_expired(&self, time_of_last_soa_check: Instant) -> bool {
+        Instant::now()
+            .checked_duration_since(time_of_last_soa_check)
+            .map(|duration_since_last_soa_check| {
+                duration_since_last_soa_check > self.expire.into_duration()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn refresh_succeeded(&mut self, new_soa: &Soa<Name<Bytes>>) {
+        self.refresh = new_soa.refresh();
+        self.retry = new_soa.retry();
+        self.expire = new_soa.expire();
+        self.metrics.last_refreshed_at = Some(Instant::now());
+        self.metrics.last_refresh_succeeded_serial = Some(new_soa.serial());
+        self.set_status(ZoneRefreshStatus::Refreshing);
+    }
+
+    pub fn soa_serial_check_succeeded(&mut self, serial: Option<Serial>) {
+        if let Some(serial) = serial {
+            self.metrics.last_soa_serial_check_serial = Some(serial);
+        }
+        self.metrics.last_soa_serial_check_succeeded_at =
+            Some(Instant::now());
+    }
+
+    pub fn age(&self) -> Option<core::time::Duration> {
+        self.metrics
+            .last_refreshed_at
+            .and_then(|at| Instant::now().checked_duration_since(at))
     }
 }
 
@@ -446,7 +520,7 @@ pub(super) enum ZoneRefreshCause {
     SoaRetryTimer,
 }
 
-impl std::fmt::Display for ZoneRefreshCause {
+impl Display for ZoneRefreshCause {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ZoneRefreshCause::ManualTrigger => f.write_str("manual trigger"),
@@ -688,7 +762,7 @@ impl ZoneReport {
 
 //--- Display
 
-impl std::fmt::Display for ZoneReport {
+impl Display for ZoneReport {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_fmt(format_args!("zone:   {}\n", self.key.0))?;
         f.write_fmt(format_args!("{}", self.details))?;
@@ -751,7 +825,7 @@ pub enum ZoneReportDetails {
 
 //--- Display
 
-impl std::fmt::Display for ZoneReportDetails {
+impl Display for ZoneReportDetails {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ZoneReportDetails::Primary => {

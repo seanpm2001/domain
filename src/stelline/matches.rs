@@ -15,7 +15,7 @@ pub fn match_msg<'a, Octs: AsRef<[u8]> + Clone + Octets + 'a>(
 where
     <Octs as Octets>::Range<'a>: Clone,
 {
-    match_multi_msg(entry, 0, msg, verbose)
+    match_multi_msg(entry, 0, msg, verbose, &mut None)
 }
 
 pub fn match_multi_msg<'a, Octs: AsRef<[u8]> + Clone + Octets + 'a>(
@@ -23,6 +23,7 @@ pub fn match_multi_msg<'a, Octs: AsRef<[u8]> + Clone + Octets + 'a>(
     idx: usize,
     msg: &'a Message<Octs>,
     verbose: bool,
+    out_answer: &mut Option<Vec<ZonefileEntry>>,
 ) -> bool
 where
     <Octs as Octets>::Range<'a>: Clone,
@@ -76,6 +77,8 @@ where
             arcount,
             matches.ttl,
             verbose,
+            false,
+            &mut None,
         ) {
             if verbose {
                 println!("match_msg: additional section does not match");
@@ -97,7 +100,10 @@ where
             msg.header_counts().ancount(),
             matches.ttl,
             verbose,
-        ) {
+            matches.extra_packets,
+            out_answer,
+        ) && !matches.extra_packets
+        {
             if verbose {
                 println!("match_msg: answer section {idx} does not match");
             }
@@ -112,6 +118,8 @@ where
             msg.header_counts().nscount(),
             matches.ttl,
             verbose,
+            false,
+            &mut None,
         )
     {
         if verbose {
@@ -258,84 +266,16 @@ where
     if matches.rcode {
         let msg_rcode =
             get_opt_rcode(&Message::from_octets(msg.as_slice()).unwrap());
-        if reply.noerror {
-            if let OptRcode::NOERROR = msg_rcode {
-                // Okay
-            } else {
+        match (reply.rcode, msg_rcode) {
+            (Some(reply_rcode), msg_rcode) if reply_rcode != msg_rcode => {
                 if verbose {
                     println!(
-                        "Wrong Rcode, expected NOERROR, got {msg_rcode}"
+                        "Wrong Rcode, expected {reply_rcode}, got {msg_rcode}"
                     );
                 }
                 return false;
             }
-        } else if reply.formerr {
-            if let OptRcode::FORMERR = msg_rcode {
-                // Okay
-            } else {
-                if verbose {
-                    println!(
-                        "Wrong Rcode, expected FORMERR, got {msg_rcode}"
-                    );
-                }
-                return false;
-            }
-        } else if reply.notimp {
-            if let OptRcode::NOTIMP = msg_rcode {
-                // Okay
-            } else {
-                if verbose {
-                    println!("Wrong Rcode, expected NOTIMP, got {msg_rcode}");
-                }
-                return false;
-            }
-        } else if reply.nxdomain {
-            if let OptRcode::NXDOMAIN = msg_rcode {
-                // Okay
-            } else {
-                if verbose {
-                    println!(
-                        "Wrong Rcode, expected NXDOMAIN, got {msg_rcode}"
-                    );
-                }
-                return false;
-            }
-        } else if reply.refused {
-            if let OptRcode::REFUSED = msg_rcode {
-                // Okay
-            } else {
-                if verbose {
-                    println!(
-                        "Wrong Rcode, expected REFUSED, got {msg_rcode}"
-                    );
-                }
-                return false;
-            }
-        } else if reply.servfail {
-            if let OptRcode::SERVFAIL = msg_rcode {
-                // Okay
-            } else {
-                if verbose {
-                    println!(
-                        "Wrong Rcode, expected SERVFAIL, got {msg_rcode}"
-                    );
-                }
-                return false;
-            }
-        } else if "BADCOOKIE" == reply.yxrrset.as_str() {
-            if !matches!(msg_rcode, OptRcode::BADCOOKIE) {
-                if verbose {
-                    println!(
-                        "Wrong Rcode, expected BADCOOKIE, got {msg_rcode}"
-                    );
-                }
-                return false;
-            }
-        } else {
-            if verbose {
-                println!("Unexpected Rcode: {msg_rcode}");
-            }
-            return false;
+            _ => { /* Okay */ }
         }
     }
     if matches.tcp {
@@ -354,6 +294,7 @@ where
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 fn match_section<
     'a,
     Octs: Clone + Octets<Range<'a> = Octs2> + 'a,
@@ -365,19 +306,26 @@ fn match_section<
     msg_count: u16,
     match_ttl: bool,
     verbose: bool,
+    allow_partial_match: bool,
+    out_entry: &mut Option<Vec<ZonefileEntry>>,
 ) -> bool {
     let mat_opt =
         match_edns_bytes.map(|bytes| Opt::from_slice(bytes).unwrap());
 
-    if match_section.len() != <u16 as Into<usize>>::into(msg_count) {
+    if !allow_partial_match
+        && match_section.len() != <u16 as Into<usize>>::into(msg_count)
+    {
         if verbose {
             println!("match_section: expected section length {} doesn't match message count {}", match_section.len(), msg_count);
             if !match_section.is_empty() {
                 println!("expected sections:");
-                for section in match_section {
+                for section in &match_section {
                     println!("  {section:?}");
                 }
             }
+        }
+        if let Some(out_entry) = out_entry {
+            *out_entry = match_section;
         }
         return false;
     }
@@ -448,6 +396,9 @@ fn match_section<
 			msg_rr.owner(), msg_rr.class(), msg_rr.rtype(),
 			msg_rr.ttl(), mat_rr.ttl());
                 }
+                if let Some(out_entry) = out_entry {
+                    *out_entry = match_section;
+                }
                 return false;
             }
             // Delete this entry
@@ -463,10 +414,16 @@ fn match_section<
                 msg_rr.rtype()
             );
         }
+        if let Some(out_entry) = out_entry {
+            *out_entry = match_section;
+        }
         return false;
     }
 
     // All entries in the reply were matched.
+    if let Some(out_entry) = out_entry {
+        *out_entry = match_section;
+    }
     true
 }
 

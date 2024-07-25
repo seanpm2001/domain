@@ -53,7 +53,7 @@ use crate::stelline::parse_stelline::{
 use crate::tsig::{Algorithm, Key, KeyName, KeyStore};
 use crate::utils::base16;
 use crate::zonecatalog::catalog::{
-    self, Catalog, ConnectionFactory, TypedZone,
+    self, Catalog, ConnectionFactory, TypedZone, ZoneError, ZoneLookup,
 };
 use crate::zonecatalog::types::{
     CatalogKeyStore, CompatibilityMode, NotifyConfig, TransportStrategy,
@@ -179,7 +179,7 @@ async fn server_tests(#[files("test-data/server/*.rpl")] rpl_file: PathBuf) {
         EdnsMiddlewareSvc::new(svc).enable(server_config.edns_tcp_keepalive);
 
     // 4. XFR(-in) middleware service (XFR-out is handled by the Catalog).
-    let svc = XfrMiddlewareSvc::<Vec<u8>, _, Arc<CatalogKeyStore>, _>::new(
+    let svc = XfrMiddlewareSvc::<Vec<u8>, _, _>::new(
         svc,
         catalog.clone(),
         MAX_XFR_CONCURRENCY,
@@ -188,7 +188,7 @@ async fn server_tests(#[files("test-data/server/*.rpl")] rpl_file: PathBuf) {
 
     // 5. NOTIFY(-in) middleware service (relayed to the Catalog for handling,
     // and the Catalog is also responsible for NOTIFY-out).
-    let svc = NotifyMiddlewareSvc::<Vec<u8>, _, _, _, _>::new(svc, catalog);
+    let svc = NotifyMiddlewareSvc::<Vec<u8>, _, _, _>::new(svc, catalog);
 
     // 6. Mandatory DNS behaviour (e.g. RFC 1034/35 rules).
     let svc = MandatoryMiddlewareSvc::new(svc);
@@ -382,23 +382,24 @@ fn mk_server_configs(
 //   - Controlling the content of the `Zonefile` passed to instances of
 //     this `Service` impl.
 #[allow(clippy::type_complexity)]
-fn test_service(
+fn test_service<T: ZoneLookup>(
     request: Request<Vec<u8>>,
-    catalog: Arc<Catalog<Arc<CatalogKeyStore>, MockServerConnFactory>>,
+    catalog: T,
 ) -> ServiceResult<Vec<u8>> {
     let question = request.message().sole_question().unwrap();
 
-    let zone = catalog
-        .find_zone(question.qname(), question.qclass())
-        .map(|zone| zone.read());
-
-    let answer = match zone {
-        Some(zone) => {
+    let answer = match catalog.find_zone(question.qname(), question.qclass())
+    {
+        Ok(Some(zone)) => {
+            let readable_zone = zone.read();
             let qname = question.qname().to_bytes();
             let qtype = question.qtype();
-            zone.query(qname, qtype).unwrap()
+            readable_zone.query(qname, qtype).unwrap()
         }
-        None => Answer::new(Rcode::NXDOMAIN),
+        Ok(None) => Answer::new(Rcode::NXDOMAIN),
+        Err(ZoneError::TemporarilyUnavailable) => {
+            Answer::new(Rcode::SERVFAIL)
+        }
     };
 
     let builder = mk_builder_for_target();
@@ -686,8 +687,7 @@ impl ConnectionFactory for TestServerConnFactory {
                 stream_config.set_response_timeout(Duration::from_secs(2));
                 // Allow time between the SOA query response and sending the
                 // AXFR/IXFR request.
-                stream_config
-                    .set_initial_idle_timeout(Duration::from_secs(5));
+                stream_config.set_idle_timeout(Duration::from_secs(5));
                 // Allow much more time for an XFR streaming response.
                 stream_config
                     .set_streaming_response_timeout(Duration::from_secs(30));
@@ -794,8 +794,7 @@ impl ConnectionFactory for MockServerConnFactory {
                 stream_config.set_response_timeout(Duration::from_secs(2));
                 // Allow time between the SOA query response and sending the
                 // AXFR/IXFR request.
-                stream_config
-                    .set_initial_idle_timeout(Duration::from_secs(5));
+                stream_config.set_idle_timeout(Duration::from_secs(5));
                 // Allow much more time for an XFR streaming response.
                 stream_config
                     .set_streaming_response_timeout(Duration::from_secs(30));

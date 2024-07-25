@@ -1,4 +1,5 @@
 //! TODO
+#![cfg(all(feature = "tsig", feature = "unstable-client-transport"))]
 #![warn(missing_docs)]
 #![warn(clippy::missing_docs_in_private_items)]
 
@@ -106,6 +107,7 @@ where
     CR: ComposeRequest,
     Upstream: SendRequest<AuthenticatedRequestMessage<CR, K>> + Send + Sync,
     K: Clone + AsRef<Key>,
+    Self: GetResponse,
 {
     /// Create a new Request object.
     fn new(request_msg: CR, key: Option<K>, upstream: Arc<Upstream>) -> Self {
@@ -186,10 +188,16 @@ where
                                         .map_err(|err| {
                                             Error::Authentication(err)
                                         })?;
+                                    if request.is_stream_complete() {
+                                        mark_as_complete = true;
+                                    }
                                 }
 
                                 _ => {
                                     trace!("Response is not signed, nothing to do");
+                                    if request.is_stream_complete() {
+                                        mark_as_complete = true;
+                                    }
                                 }
                             }
 
@@ -211,7 +219,7 @@ where
         };
 
         if mark_as_complete {
-            self.state = RequestState::Complete;
+            self.stream_complete()?;
         }
 
         res

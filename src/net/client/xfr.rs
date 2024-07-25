@@ -1,4 +1,5 @@
 //! TODO
+#![cfg(feature = "unstable-client-transport")]
 #![warn(missing_docs)]
 #![warn(clippy::missing_docs_in_private_items)]
 
@@ -13,13 +14,20 @@ use bytes::Bytes;
 use tokio::time::Instant;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::base::name::{FlattenInto, Label, ToLabelIter};
-use crate::base::{Message, Name, ParsedName, Rtype, Serial, ToName};
+use crate::base::name::FlattenInto;
+#[cfg(feature = "unstable-zonetree")]
+use crate::base::name::{Label, ToLabelIter};
+#[cfg(feature = "unstable-zonetree")]
+use crate::base::ToName;
+use crate::base::{Message, Name, ParsedName, Rtype, Serial};
 use crate::net::client::request::{
     ComposeRequest, Error, GetResponse, SendRequest,
 };
 use crate::rdata::{Soa, ZoneRecordData};
+
+#[cfg(feature = "unstable-zonetree")]
 use crate::zonetree::error::OutOfZone;
+#[cfg(feature = "unstable-zonetree")]
 use crate::zonetree::{
     Rrset, SharedRrset, WritableZone, WritableZoneNode, Zone,
 };
@@ -33,14 +41,20 @@ pub struct Connection<Upstream> {
     upstream: Arc<Upstream>,
 
     /// The zone to update.
+    #[cfg(feature = "unstable-zonetree")]
     zone: Option<Zone>,
 }
 
 impl<Upstream> Connection<Upstream> {
     /// TODO
-    pub fn new(zone: Option<Zone>, upstream: Upstream) -> Self {
+
+    pub fn new(
+        #[cfg(feature = "unstable-zonetree")] zone: Option<Zone>,
+        upstream: Upstream,
+    ) -> Self {
         Self {
             upstream: Arc::new(upstream),
+            #[cfg(feature = "unstable-zonetree")]
             zone,
         }
     }
@@ -59,6 +73,7 @@ where
     ) -> Box<dyn GetResponse + Send + Sync> {
         Box::new(Request::<CR, Upstream>::new(
             request_msg,
+            #[cfg(feature = "unstable-zonetree")]
             self.zone.clone(),
             self.upstream.clone(),
         ))
@@ -83,12 +98,15 @@ where
     upstream: Arc<Upstream>,
 
     /// The zone to update.
+    #[cfg(feature = "unstable-zonetree")]
     zone: Option<Zone>,
 
     /// TODO
+    #[cfg(feature = "unstable-zonetree")]
     write: Option<Box<dyn WritableZone>>,
 
     /// TODO
+    #[cfg(feature = "unstable-zonetree")]
     writable: Option<Box<dyn WritableZoneNode>>,
 
     /// TODO
@@ -120,6 +138,9 @@ where
 
     /// TODO
     last_progress_report: Option<Instant>,
+
+    /// TODO
+    complete: bool,
 }
 
 impl<CR, Upstream> Request<CR, Upstream>
@@ -130,14 +151,17 @@ where
     /// Create a new Request object.
     fn new(
         request_msg: CR,
-        zone: Option<Zone>,
+        #[cfg(feature = "unstable-zonetree")] zone: Option<Zone>,
         upstream: Arc<Upstream>,
     ) -> Self {
         Self {
             request_msg: Some(request_msg),
             send_request: None,
+            #[cfg(feature = "unstable-zonetree")]
             zone,
+            #[cfg(feature = "unstable-zonetree")]
             write: None,
+            #[cfg(feature = "unstable-zonetree")]
             writable: None,
             upstream,
             xfr_type: None,
@@ -150,6 +174,7 @@ where
             initial_soa_serial_seen_count: 0,
             start_time: Instant::now(),
             last_progress_report: None,
+            complete: false,
         }
     }
 
@@ -227,7 +252,33 @@ where
                 };
         }
 
+        #[cfg(feature = "unstable-zonetree")]
         let mut ixfr_update_mode = IxfrUpdateMode::Deleting;
+
+        /// TODO
+        #[cfg(feature = "unstable-zonetree")]
+        async fn commit(
+            writable: Option<Box<dyn WritableZoneNode>>,
+            write: Option<Box<dyn WritableZone>>,
+        ) -> Result<bool, Error> {
+            // Commit the deletes and adds that just occurred
+            if let Some(writable) = writable {
+                // Ensure that there are no dangling references to the created
+                // diff (otherwise commit() will panic).
+                drop(writable);
+
+                if let Some(mut write) = write {
+                    write
+                        .commit(false)
+                        .await
+                        .map_err(|_| Error::ZoneWrite)?;
+
+                    return Ok(true);
+                }
+            }
+
+            Ok(false)
+        }
 
         match msg.answer() {
             Ok(answer) => {
@@ -256,11 +307,15 @@ where
                     }
 
                     let owner = record.owner().to_owned();
+                    #[cfg(feature = "unstable-zonetree")]
                     let ttl = record.ttl();
+                    #[cfg(feature = "unstable-zonetree")]
                     let rtype = record.rtype();
-                    let data = record.into_data().flatten_into();
+                    let data: ZoneRecordData<Bytes, Name<Bytes>> =
+                        record.into_data().flatten_into();
 
                     if let ZoneRecordData::Soa(soa) = &data {
+                        #[cfg(feature = "unstable-zonetree")]
                         if self.xfr_type == Some(Rtype::IXFR) && self.n > 1 {
                             match ixfr_update_mode {
                                 IxfrUpdateMode::Deleting => {
@@ -275,39 +330,24 @@ where
                                         IxfrUpdateMode::Deleting;
 
                                     if let Some(zone) = &self.zone {
-                                        // Commit the deletes and adds that just occurred
-                                        if let Some(writable) =
-                                            self.writable.take()
+                                        if commit(
+                                            self.writable.take(),
+                                            self.write.take(),
+                                        )
+                                        .await?
                                         {
-                                            // Ensure that there are no
-                                            // dangling references to the
-                                            // created diff (otherwise
-                                            // commit() will panic).
-                                            drop(writable);
+                                            let new_serial = self
+                                                .initial_soa
+                                                .as_ref()
+                                                .unwrap()
+                                                .serial();
 
-                                            if let Some(mut write) =
-                                                self.write.take()
-                                            {
-                                                write
-                                                    .commit(false)
-                                                    .await
-                                                    .map_err(|_| {
-                                                        Error::ZoneWrite
-                                                    })?;
-
-                                                let new_serial = self
-                                                    .initial_soa
-                                                    .as_ref()
-                                                    .unwrap()
-                                                    .serial();
-
-                                                info!(
-                                                        "Zone '{}' has been updated to serial {} by {}",
-                                                        zone.apex_name(),
-                                                        new_serial,
-                                                        self.xfr_type.unwrap(),
-                                                    );
-                                            }
+                                            info!(
+                                                    "Zone '{}' has been updated to serial {} by {}",
+                                                    zone.apex_name(),
+                                                    new_serial,
+                                                    self.xfr_type.unwrap(),
+                                                );
                                         }
                                     }
                                 }
@@ -329,9 +369,30 @@ where
                                     trace!("Closing response stream at record nr {} (soa seen count = {})",
                                         self.i, self.initial_soa_serial_seen_count);
                                     send_request.stream_complete()?;
+                                    self.stream_complete()?;
 
+                                    #[cfg(feature = "unstable-zonetree")]
                                     if let Some(zone) = &self.zone {
                                         info!("{} progress report for zone '{}': Transfer complete, commiting changes.", self.xfr_type.unwrap(), zone.apex_name());
+                                        if commit(
+                                            self.writable.take(),
+                                            self.write.take(),
+                                        )
+                                        .await?
+                                        {
+                                            let new_serial = self
+                                                .initial_soa
+                                                .as_ref()
+                                                .unwrap()
+                                                .serial();
+
+                                            info!(
+                                                    "Zone '{}' has been updated to serial {} by {}",
+                                                    zone.apex_name(),
+                                                    new_serial,
+                                                    self.xfr_type.unwrap(),
+                                                );
+                                        }
                                     } else {
                                         info!(
                                             "{} progress report for zone '{}': Transfer complete.",
@@ -375,133 +436,146 @@ where
                         self.last_progress_report = Some(now);
                     }
 
-                    let Some(zone) = &self.zone else {
+                    #[cfg(feature = "unstable-zonetree")]
+                    let Some(zone) = &self.zone
+                    else {
                         continue;
                     };
 
-                    let writable = match &self.writable {
-                        Some(writable) => writable,
-                        None => {
-                            let new_write = zone.write().await;
-                            self.writable = Some(
-                                new_write
-                                    .open(true)
-                                    .await
-                                    .map_err(|_| Error::ZoneWrite)?,
-                            );
-                            self.write = Some(new_write);
-                            self.writable.as_ref().unwrap()
-                        }
-                    };
-
-                    let mut end_node: Option<Box<dyn WritableZoneNode>> =
-                        None;
-
-                    let name = Self::mk_relative_name_iterator(
-                        zone.apex_name(),
-                        &owner,
-                    )
-                    .map_err(|_| Error::MessageParseError)?;
-
-                    for label in name {
-                        trace!("Relativised label: {label}");
-                        end_node = Some(
-                            match end_node {
-                                Some(new_node) => {
-                                    new_node.update_child(label)
-                                }
-                                None => writable.update_child(label),
-                            }
-                            .await
-                            .map_err(|_| Error::ZoneWrite)?,
-                        );
-                    }
-
-                    if self.xfr_type == Some(Rtype::AXFR)
-                        || (self.xfr_type == Some(Rtype::IXFR)
-                            && ixfr_update_mode == IxfrUpdateMode::Adding)
+                    #[cfg(feature = "unstable-zonetree")]
                     {
-                        let mut rrset = Rrset::new(rtype, ttl);
-                        rrset.push_data(data);
-
-                        trace!("Adding RR: {:?}", rrset);
-
-                        match end_node {
-                            Some(n) => {
-                                trace!("Adding RR at end_node");
-
-                                if let Some(existing_rrset) = n
-                                    .get_rrset(rtype)
-                                    .await
-                                    .map_err(|_| Error::ZoneWrite)?
-                                {
-                                    for existing_data in existing_rrset.data()
-                                    {
-                                        rrset
-                                            .push_data(existing_data.clone());
-                                    }
-                                }
-
-                                n.update_rrset(SharedRrset::new(rrset))
-                                    .await
-                                    .map_err(|_| Error::ZoneWrite)?;
-                            }
+                        let writable = match &self.writable {
+                            Some(writable) => writable,
                             None => {
-                                trace!("Adding RR at root");
-                                writable
-                                    .update_rrset(SharedRrset::new(rrset))
-                                    .await
-                                    .map_err(|_| Error::ZoneWrite)?;
+                                let new_write = zone.write().await;
+                                self.writable = Some(
+                                    new_write
+                                        .open(true)
+                                        .await
+                                        .map_err(|_| Error::ZoneWrite)?,
+                                );
+                                self.write = Some(new_write);
+                                self.writable.as_ref().unwrap()
                             }
-                        }
-                    } else {
-                        trace!("Deleting RR for {rtype}");
-                        let mut rrset = Rrset::new(rtype, ttl);
-                        match end_node {
-                            Some(n) => {
-                                trace!("Deleting RR at end_node");
+                        };
 
-                                if let Some(existing_rrset) = n
-                                    .get_rrset(rtype)
-                                    .await
-                                    .map_err(|_| Error::ZoneWrite)?
-                                {
-                                    for existing_data in existing_rrset.data()
+                        let mut end_node: Option<Box<dyn WritableZoneNode>> =
+                            None;
+
+                        let name = Self::mk_relative_name_iterator(
+                            zone.apex_name(),
+                            &owner,
+                        )
+                        .map_err(|_| Error::MessageParseError)?;
+
+                        for label in name {
+                            trace!("Relativised label: {label}");
+                            end_node = Some(
+                                match end_node {
+                                    Some(new_node) => {
+                                        new_node.update_child(label)
+                                    }
+                                    None => writable.update_child(label),
+                                }
+                                .await
+                                .map_err(|_| Error::ZoneWrite)?,
+                            );
+                        }
+
+                        if self.xfr_type == Some(Rtype::AXFR)
+                            || (self.xfr_type == Some(Rtype::IXFR)
+                                && ixfr_update_mode == IxfrUpdateMode::Adding)
+                        {
+                            let mut rrset = Rrset::new(rtype, ttl);
+                            rrset.push_data(data);
+
+                            trace!("Adding RR: {:?}", rrset);
+
+                            match end_node {
+                                Some(n) => {
+                                    trace!("Adding RR at end_node");
+
+                                    if let Some(existing_rrset) = n
+                                        .get_rrset(rtype)
+                                        .await
+                                        .map_err(|_| Error::ZoneWrite)?
                                     {
-                                        if existing_data != &data {
+                                        for existing_data in
+                                            existing_rrset.data()
+                                        {
                                             rrset.push_data(
                                                 existing_data.clone(),
                                             );
                                         }
                                     }
 
-                                    trace!("Removing single RR of {rtype} so updating RRSET");
                                     n.update_rrset(SharedRrset::new(rrset))
                                         .await
                                         .map_err(|_| Error::ZoneWrite)?;
                                 }
-                            }
-                            None => {
-                                trace!("Deleting RR at root");
-                                if let Some(existing_rrset) = writable
-                                    .get_rrset(rtype)
-                                    .await
-                                    .map_err(|_| Error::ZoneWrite)?
-                                {
-                                    for existing_data in existing_rrset.data()
-                                    {
-                                        if existing_data != &data {
-                                            rrset.push_data(
-                                                existing_data.clone(),
-                                            );
-                                        }
-                                    }
-
-                                    trace!("Removing single RR of {rtype} so updating RRSET");
+                                None => {
+                                    trace!("Adding RR at root");
                                     writable
                                         .update_rrset(SharedRrset::new(rrset))
                                         .await
                                         .map_err(|_| Error::ZoneWrite)?;
+                                }
+                            }
+                        } else {
+                            trace!("Deleting RR for {rtype}");
+                            let mut rrset = Rrset::new(rtype, ttl);
+                            match end_node {
+                                Some(n) => {
+                                    trace!("Deleting RR at end_node");
+
+                                    if let Some(existing_rrset) = n
+                                        .get_rrset(rtype)
+                                        .await
+                                        .map_err(|_| Error::ZoneWrite)?
+                                    {
+                                        for existing_data in
+                                            existing_rrset.data()
+                                        {
+                                            if existing_data != &data {
+                                                rrset.push_data(
+                                                    existing_data.clone(),
+                                                );
+                                            }
+                                        }
+
+                                        trace!("Removing single RR of {rtype} so updating RRSET");
+                                        n.update_rrset(SharedRrset::new(
+                                            rrset,
+                                        ))
+                                        .await
+                                        .map_err(|_| Error::ZoneWrite)?;
+                                    }
+                                }
+                                None => {
+                                    trace!("Deleting RR at root");
+                                    if let Some(existing_rrset) = writable
+                                        .get_rrset(rtype)
+                                        .await
+                                        .map_err(|_| Error::ZoneWrite)?
+                                    {
+                                        for existing_data in
+                                            existing_rrset.data()
+                                        {
+                                            if existing_data != &data {
+                                                rrset.push_data(
+                                                    existing_data.clone(),
+                                                );
+                                            }
+                                        }
+
+                                        trace!("Removing single RR of {rtype} so updating RRSET");
+                                        writable
+                                            .update_rrset(SharedRrset::new(
+                                                rrset,
+                                            ))
+                                            .await
+                                            .map_err(|_| Error::ZoneWrite)?;
+                                    }
                                 }
                             }
                         }
@@ -519,6 +593,7 @@ where
     }
 
     /// TODO
+    #[cfg(feature = "unstable-zonetree")]
     fn mk_relative_name_iterator<'l>(
         apex_name: &Name<Bytes>,
         qname: &'l impl ToName,
@@ -566,11 +641,21 @@ where
     > {
         Box::pin(self.get_response_impl())
     }
+
+    fn stream_complete(&mut self) -> Result<(), Error> {
+        self.complete = true;
+        Ok(())
+    }
+
+    fn is_stream_complete(&self) -> bool {
+        self.complete
+    }
 }
 
 //------------ IxfrUpdateMode -------------------------------------------------
 
 /// TODO
+#[cfg(feature = "unstable-zonetree")]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum IxfrUpdateMode {
     /// TODO

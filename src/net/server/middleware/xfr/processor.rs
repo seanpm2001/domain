@@ -1,40 +1,37 @@
 //! XFR request handling middleware.
 
-use core::future::{ready, Future, Ready};
+use core::future::ready;
 use core::marker::PhantomData;
 use core::ops::ControlFlow;
-use core::pin::Pin;
 
 use std::boxed::Box;
-use std::ops::Deref;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures::stream::{once, Once, Stream};
+use futures::stream::{once, Stream};
 use octseq::Octets;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::sync::Semaphore;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{error, info, trace, warn};
 
-use crate::base::iana::{Opcode, OptRcode, Rcode};
-use crate::base::message_builder::{
-    AdditionalBuilder, AnswerBuilder, PushError,
-};
+use crate::base::iana::{Opcode, OptRcode};
+use crate::base::message_builder::AdditionalBuilder;
 use crate::base::net::IpAddr;
-use crate::base::record::ComposeRecord;
 use crate::base::wire::Composer;
 use crate::base::{
     Message, Name, ParsedName, Question, Rtype, Serial, StreamTarget, ToName,
 };
+use crate::net::server::batcher::ResourceRecordBatcher;
 use crate::net::server::message::{Request, TransportSpecificContext};
+use crate::net::server::middleware::stream::MiddlewareStream;
 use crate::net::server::service::{
     CallResult, Service, ServiceFeedback, ServiceResult,
 };
 use crate::net::server::util::{mk_builder_for_target, mk_error_response};
 use crate::rdata::{Soa, ZoneRecordData};
-use crate::tsig::{KeyName, KeyStore};
-use crate::zonecatalog::catalog::{Catalog, CatalogZone, ConnectionFactory};
+use crate::tsig::KeyName;
+use crate::zonecatalog::catalog::{CatalogZone, ZoneError, ZoneLookup};
 use crate::zonecatalog::types::{
     CompatibilityMode, XfrConfig, XfrStrategy, ZoneInfo,
 };
@@ -43,27 +40,8 @@ use crate::zonetree::{
     Answer, AnswerContent, ReadableZone, SharedRrset, StoredName,
 };
 
-use super::stream::MiddlewareStream;
-
-//------------ XfrMapStream --------------------------------------------------
-
-type XfrResultStream<StreamItem> = UnboundedReceiverStream<StreamItem>;
-
-//------------ XfrMiddlewareStream -------------------------------------------
-
-type XfrMiddlewareStream<Future, Stream, StreamItem> = MiddlewareStream<
-    Future,
-    Stream,
-    Once<Ready<StreamItem>>,
-    XfrResultStream<StreamItem>,
-    StreamItem,
->;
-
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub enum XfrMode {
-    AxfrAndIxfr,
-    AxfrOnly,
-}
+use super::batcher::XfrRrBatcher;
+use super::types::{IxfrResult, XfrMiddlewareStream, XfrMode};
 
 //------------ XfrMiddlewareSvc ----------------------------------------------
 
@@ -85,31 +63,26 @@ pub enum XfrMode {
 /// [1995]: https://datatracker.ietf.org/doc/html/rfc1995
 /// [5936]: https://datatracker.ietf.org/doc/html/rfc5936
 #[derive(Clone, Debug)]
-pub struct XfrMiddlewareSvc<RequestOctets, NextSvc, KS, CF>
+pub struct XfrMiddlewareSvc<RequestOctets, NextSvc, ZL>
 where
-    KS: Default + Deref,
-    KS::Target: KeyStore,
-    CF: ConnectionFactory,
+    ZL: ZoneLookup + Clone + Sync + Send + 'static,
 {
-    next_svc: NextSvc,
+    pub(super) next_svc: NextSvc,
 
-    catalog: Arc<Catalog<KS, CF>>,
+    pub(super) zones: ZL,
 
-    zone_walking_semaphore: Arc<Semaphore>,
+    pub(super) zone_walking_semaphore: Arc<Semaphore>,
 
-    batcher_semaphore: Arc<Semaphore>,
+    pub(super) batcher_semaphore: Arc<Semaphore>,
 
-    xfr_mode: XfrMode,
+    pub(super) xfr_mode: XfrMode,
 
     _phantom: PhantomData<RequestOctets>,
 }
 
-impl<RequestOctets, NextSvc, KS, CF>
-    XfrMiddlewareSvc<RequestOctets, NextSvc, KS, CF>
+impl<RequestOctets, NextSvc, ZL> XfrMiddlewareSvc<RequestOctets, NextSvc, ZL>
 where
-    KS: Default + Deref,
-    KS::Target: KeyStore,
-    CF: ConnectionFactory,
+    ZL: ZoneLookup + Clone + Sync + Send + 'static,
 {
     /// Creates an empty processor instance.
     ///
@@ -119,7 +92,7 @@ where
     #[must_use]
     pub fn new(
         next_svc: NextSvc,
-        catalog: Arc<Catalog<KS, CF>>,
+        zones: ZL,
         max_concurrency: usize,
         xfr_mode: XfrMode,
     ) -> Self {
@@ -129,7 +102,7 @@ where
 
         Self {
             next_svc,
-            catalog,
+            zones,
             zone_walking_semaphore,
             batcher_semaphore,
             xfr_mode,
@@ -138,8 +111,7 @@ where
     }
 }
 
-impl<RequestOctets, NextSvc, KS, CF>
-    XfrMiddlewareSvc<RequestOctets, NextSvc, KS, CF>
+impl<RequestOctets, NextSvc, ZL> XfrMiddlewareSvc<RequestOctets, NextSvc, ZL>
 where
     RequestOctets: Octets + Send + Sync + 'static + Unpin,
     for<'a> <RequestOctets as octseq::Octets>::Range<'a>: Send + Sync,
@@ -147,15 +119,13 @@ where
     NextSvc::Future: Send + Sync + Unpin,
     NextSvc::Target: Composer + Default + Send + Sync,
     NextSvc::Stream: Send + Sync,
-    KS: Default + Deref,
-    KS::Target: KeyStore,
-    CF: ConnectionFactory,
+    ZL: ZoneLookup + Clone + Sync + Send + 'static,
 {
-    async fn preprocess<T>(
+    pub(super) async fn preprocess<T>(
         zone_walking_semaphore: Arc<Semaphore>,
         batcher_semaphore: Arc<Semaphore>,
         req: &Request<RequestOctets, T>,
-        catalog: Arc<Catalog<KS, CF>>,
+        zones: ZL,
         xfr_mode: XfrMode,
         get_key_for_req: fn(&Request<RequestOctets, T>) -> Option<&KeyName>,
     ) -> ControlFlow<
@@ -174,24 +144,43 @@ where
         let qname: Name<Bytes> = q.qname().to_name();
 
         // Find the zone
-        let Some(zone) = catalog.get_zone(&qname, q.qclass()) else {
-            // https://datatracker.ietf.org/doc/html/rfc5936#section-2.2.1
-            // 2.2.1 Header Values
-            //   "If a server is not authoritative for the queried zone, the
-            //    server SHOULD set the value to NotAuth(9)"
-            warn!(
-                "{} for {qname} from {} refused: unknown zone",
-                q.qtype(),
-                req.client_addr()
-            );
+        let zone = match zones.get_zone(&qname, q.qclass()) {
+            Ok(Some(zone)) => zone,
 
-            // Note: This may not be strictly true, we may be authoritative
-            // for the zone but not willing to transfer it, but we can't know
-            // here which is the case.
-            return ControlFlow::Break(Self::to_stream(mk_error_response(
-                msg,
-                OptRcode::NOTAUTH,
-            )));
+            Ok(None) => {
+                // https://datatracker.ietf.org/doc/html/rfc5936#section-2.2.1
+                // 2.2.1 Header Values
+                //   "If a server is not authoritative for the queried zone, the
+                //    server SHOULD set the value to NotAuth(9)"
+                warn!(
+                    "{} for {qname} from {} refused: unknown zone",
+                    q.qtype(),
+                    req.client_addr()
+                );
+
+                // Note: This may not be strictly true, we may be authoritative
+                // for the zone but not willing to transfer it, but we can't know
+                // here which is the case.
+                return ControlFlow::Break(Self::to_stream(
+                    mk_error_response(msg, OptRcode::NOTAUTH),
+                ));
+            }
+
+            Err(ZoneError::TemporarilyUnavailable) => {
+                // The zone is not yet loaded or has expired, both of which
+                // are presumably transient conditions and thus SERVFAIL is the
+                // appropriate response, not NOTAUTH, as we know we are supposed
+                // to be authoritative for the zone but we just don't have the
+                // data right now.
+                warn!(
+                    "{} for {qname} from {} refused: zone not currently available",
+                    q.qtype(),
+                    req.client_addr()
+                );
+                return ControlFlow::Break(Self::to_stream(
+                    mk_error_response(msg, OptRcode::SERVFAIL),
+                ));
+            }
         };
 
         // Only provide XFR if allowed.
@@ -581,17 +570,7 @@ where
         // DNS response message and pass the created messages downstream to
         // the caller.
         let msg = msg.clone();
-
-        let soft_byte_limit = match req.transport_ctx() {
-            TransportSpecificContext::Udp(ctx) => {
-                let max_msg_size =
-                    ctx.max_response_size_hint().unwrap_or(512);
-                max_msg_size - req.num_reserved_bytes()
-            }
-            TransportSpecificContext::NonUdp(_) => {
-                65535 - req.num_reserved_bytes()
-            }
-        };
+        let soft_byte_limit = Self::calc_msg_bytes_available(req);
 
         tokio::spawn(async move {
             // Limit the number of concurrently running XFR batching
@@ -607,14 +586,6 @@ where
                 unreachable!();
             };
 
-            let (mut owner, zone_rrset) = batcher_rx.recv().await.unwrap();
-            assert_eq!(zone_rrset.rtype(), Rtype::SOA);
-            let saved_soa_rrset = zone_rrset.clone();
-            let mut soa_seen_count = 0;
-
-            let mut current_rrset = zone_rrset;
-            let mut rrset_to_process = current_rrset.data();
-
             // Note: NSD apparently uses name compresson on AXFR responses
             // because AXFR responses they typically contain lots of
             // alphabetically ordered duplicate names which compress well. NSD
@@ -627,139 +598,35 @@ where
             // TODO: Once we start supporting name compression in responses decide
             // if we want to behave the same way.
 
-            let mut batcher = RrBatcher::new(msg.clone());
-            if compatibility_mode {
-                batcher.set_hard_rr_limit(1);
-            }
+            let hard_rr_limit = match compatibility_mode {
+                true => Some(1),
+                false => None,
+            };
 
-            batcher.set_soft_byte_limit(soft_byte_limit);
+            let mut batcher = XfrRrBatcher::build(
+                msg.clone(),
+                sender.clone(),
+                Some(soft_byte_limit),
+                hard_rr_limit,
+            );
 
-            // Loop until all of the RRsets sent by the zone walker have been
-            // pushed into DNS response messages and sent into the result
-            // stream.
-            let mut rrset_progress = 0;
-            'outer: loop {
-                // Loop over the RRset items being sent by the zone walker and
-                // add as many of them as possible to the response being
-                // built.
-
-                let builder = 'inner: loop {
-                    if rrset_to_process == saved_soa_rrset.data() {
-                        soa_seen_count += 1;
-                    }
-
-                    for rr in rrset_to_process {
-                        trace!(
-                            "Adding [{}/{}] {owner} {qclass} {} {:?} {rr} to batch",
-                            rrset_progress+1,
-                            rrset_to_process.len(),
-                            current_rrset.rtype(),
-                            current_rrset.ttl()
-                        );
-                        let res = batcher.push((
-                            owner.clone(),
-                            qclass,
-                            current_rrset.ttl(),
-                            rr,
-                        ));
-
-                        match res {
-                            Ok(PushResult::PushedAndReadyForMore) => {
-                                // Message still has space, keep going.
-                                rrset_progress += 1;
-                            }
-
-                            Ok(PushResult::PushedAndLimitReached(
-                                builder,
-                            )) => {
-                                // Pushed and configured limit reached, send it.
-                                rrset_progress += 1;
-                                trace!("Pushed and limit reached");
-                                break 'inner Some(builder);
-                            }
-
-                            Ok(PushResult::NotPushedMessageFull(builder)) => {
-                                // Message is full, send what we have so far.
-                                trace!("Message is full");
-                                break 'inner Some(builder);
-                            }
-
-                            Err(err) => {
-                                error!("Internal error: Unable to add RR to AXFR response message: {err}");
-                                break 'outer;
-                            }
-
-                            _ => unreachable!(),
-                        }
-                    }
-
-                    if soa_seen_count == 2 {
-                        trace!("SOA seen count == 2, stopping");
-                        // This is our signal to stop, as the AXFR message
-                        // starts and ends with the zone SOA.
-                        break 'inner batcher.take();
-                    } else {
-                        // Fetch more RRsets to add to the message.
-                        let Some((new_owner, new_rrset)) =
-                            batcher_rx.recv().await
-                        else {
-                            trace!("Fetch failed");
-                            let mut additional =
-                                mk_error_response(&msg, OptRcode::SERVFAIL);
-                            Self::set_axfr_header(&msg, &mut additional);
-                            let call_result = Ok(CallResult::new(additional));
-                            trace!("Sending");
-                            sender.send(call_result).unwrap(); // TODO: Handle this Result
-                            break 'outer;
-                        };
-                        (owner, current_rrset) = (new_owner, new_rrset);
-                        rrset_to_process = current_rrset.data();
-                        rrset_progress = 0;
-                    }
-                };
-
-                // Send the message.
-                if let Some(builder) = builder {
-                    trace!("Sending");
-                    let mut additional = builder.additional();
-                    Self::set_axfr_header(&msg, &mut additional);
-                    let call_result = Ok(CallResult::new(additional));
-                    if sender.send(call_result).is_err() {
+            while let Some((owner, rrset)) = batcher_rx.recv().await {
+                for rr in rrset.data() {
+                    if batcher
+                        .push((owner.clone(), qclass, rrset.ttl(), rr))
+                        .is_err()
+                    {
+                        error!("Internal error: Failed to send final AXFR SOA to batcher");
+                        let resp =
+                            mk_error_response(&msg, OptRcode::SERVFAIL);
+                        Self::add_to_stream(CallResult::new(resp), &sender);
                         batcher_rx.close();
                         return;
                     }
                 }
-
-                if rrset_progress < rrset_to_process.len() {
-                    trace!("Current RRSET not yet fully batched ({} RRs remain), continuing..", rrset_to_process.len()-rrset_progress);
-                    // Some RRs from the current RRset didn't fit in the last
-                    // message, process these before fetching another RRset
-                    // from the incoming queue.
-                    rrset_to_process = &rrset_to_process[rrset_progress..];
-                    rrset_progress = 0;
-                } else if soa_seen_count == 2 {
-                    trace!("SOA seen count == 2, really stopping");
-                    break;
-                } else {
-                    // Fetch more RRsets to add to the message from the incoming queue.
-                    trace!("Fetching more records");
-                    let Some((new_owner, new_rrset)) =
-                        batcher_rx.recv().await
-                    else {
-                        trace!("Fetch failed");
-                        let mut additional =
-                            mk_error_response(&msg, OptRcode::SERVFAIL);
-                        Self::set_axfr_header(&msg, &mut additional);
-                        let call_result = Ok(CallResult::new(additional));
-                        trace!("Sending");
-                        sender.send(call_result).unwrap(); // TODO: Handle this Result
-                        break 'outer;
-                    };
-                    (owner, current_rrset) = (new_owner, new_rrset);
-                    rrset_to_process = current_rrset.data();
-                    rrset_progress = 0;
-                }
             }
+
+            batcher.finish().unwrap(); // TODO
 
             trace!("Finishing transaction");
             Self::add_to_stream(
@@ -939,6 +806,8 @@ where
 
         // Stream the IXFR diffs in the background
         let msg = msg.clone();
+        let soft_byte_limit = Self::calc_msg_bytes_available(req);
+
         tokio::spawn(async move {
             // Limit the number of concurrently running XFR batching
             // operations.
@@ -981,75 +850,21 @@ where
                 (q.qname().to_name::<Bytes>(), q.qclass())
             };
 
-            let mut batcher = RrBatcher::new(msg.clone());
-            let cloned_msg = msg.clone();
-            let cloned_sender = sender.clone();
-            batcher.set_cb(Box::new(move |builder| {
-                trace!("sending intermediate batch");
-                let mut additional = builder.additional();
-                Self::set_axfr_header(&cloned_msg, &mut additional);
-                let call_result = Ok(CallResult::new(additional));
-                let _ = cloned_sender.send(call_result); // TODO: Handle this Result.
-                Ok(())
-            }));
-
-            // let first_and_last_soa_rr = (
-            //     owner.clone(),
-            //     qclass,
-            //     zone_soa_rrset.ttl(),
-            //     &zone_soa_rrset.data()[0],
-            // );
-            // batcher
-            //     .push_with_cb(first_and_last_soa_rr)
-            //     .expect("HANDLE ME");
-
-            // fn push_rrset<RequestOctets, Target>(
-            //     batcher: &mut RrBatcher<RequestOctets, Target>,
-            //     owner: &Name<Bytes>,
-            //     rrsets: &[SharedRrset],
-            // ) where
-            //     RequestOctets: Octets,
-            //     Target: Composer,
-            //     Target: Default,
-            // {
-            //     trace!("PUSHING: RRSETS");
-            //     for rrset in rrsets {
-            //         trace!("PUSHING: RRSET");
-            //         // for rr in rrset.data() {
-            //         //     trace!("PUSHING RR: {rr:?}");
-            //         //     if matches!(
-            //         //         batcher
-            //         //             .push_with_cb((
-            //         //                 owner.clone(),
-            //         //                 Class::IN,
-            //         //                 rrset.ttl(),
-            //         //                 &rr
-            //         //             ))
-            //         //             .expect("HANDLE ME"),
-            //         //         PushResult::Retry
-            //         //     ) {
-            //         //         batcher
-            //         //             .push_with_cb((
-            //         //                 owner.clone(),
-            //         //                 Class::IN,
-            //         //                 rrset.ttl(),
-            //         //                 &rr,
-            //         //             ))
-            //         //             .expect("HANDLE ME");
-            //         //     }
-            //         // }
-            //         // batcher.push_with_cb((owner.clone(), Class::IN, rrset.ttl(), rrset.data())).expect("HANDLE ME");
-            //     }
-            // }
+            let mut batcher = XfrRrBatcher::build(
+                msg.clone(),
+                sender.clone(),
+                Some(soft_byte_limit),
+                None,
+            );
 
             batcher
-                .push_with_cb((
+                .push((
                     owner.clone(),
                     qclass,
                     zone_soa_rrset.ttl(),
                     &zone_soa_rrset.data()[0],
                 ))
-                .expect("HANDLE ME");
+                .unwrap(); // TODO
 
             for diff in diffs {
                 // 4. Response Format
@@ -1061,71 +876,65 @@ where
                 let soa_k = &(owner.clone(), Rtype::SOA);
                 let removed_soa = diff.removed.get(soa_k).unwrap(); // The zone MUST have a SOA record
                 batcher
-                    .push_with_cb((
+                    .push((
                         owner.clone(),
                         qclass,
                         removed_soa.ttl(),
                         &removed_soa.data()[0],
                     ))
-                    .expect("HANDLE ME");
+                    .unwrap(); // TODO
 
                 diff.removed.iter().for_each(|((owner, rtype), rrset)| {
                     if *rtype != Rtype::SOA {
                         for rr in rrset.data() {
                             batcher
-                                .push_with_cb((
+                                .push((
                                     owner.clone(),
                                     qclass,
                                     rrset.ttl(),
                                     rr,
                                 ))
-                                .expect("HANDLE ME");
+                                .unwrap(); // TODO
                         }
                     }
                 });
 
                 let added_soa = diff.added.get(soa_k).unwrap(); // The zone MUST have a SOA record
                 batcher
-                    .push_with_cb((
+                    .push((
                         owner.clone(),
                         qclass,
                         added_soa.ttl(),
                         &added_soa.data()[0],
                     ))
-                    .expect("HANDLE ME");
+                    .unwrap(); // TODO
 
                 diff.added.iter().for_each(|((owner, rtype), rrset)| {
                     if *rtype != Rtype::SOA {
                         for rr in rrset.data() {
                             batcher
-                                .push_with_cb((
+                                .push((
                                     owner.clone(),
                                     qclass,
                                     rrset.ttl(),
                                     rr,
                                 ))
-                                .expect("HANDLE ME");
+                                .unwrap(); // TODO
                         }
                     }
                 });
             }
 
             batcher
-                .push_with_cb((
+                .push((
                     owner,
                     qclass,
                     zone_soa_rrset.ttl(),
                     &zone_soa_rrset.data()[0],
                 ))
-                .expect("HANDLE ME");
+                .unwrap(); // TODO
 
-            if let Some(builder) = batcher.take() {
-                trace!("sending final batch");
-                let mut additional = builder.additional();
-                Self::set_axfr_header(&msg, &mut additional);
-                let call_result = Ok(CallResult::new(additional));
-                let _ = sender.send(call_result); // TODO: Handle this Result.
-            }
+            batcher.finish().unwrap(); // TODO
 
             trace!("Ending transaction");
             Self::add_to_stream(
@@ -1142,48 +951,6 @@ where
         sender: &UnboundedSender<ServiceResult<NextSvc::Target>>,
     ) {
         sender.send(Ok(call_result)).unwrap(); // TODO: Handle this Result
-    }
-
-    fn set_axfr_header(
-        msg: &Message<RequestOctets>,
-        additional: &mut AdditionalBuilder<StreamTarget<NextSvc::Target>>,
-    ) {
-        // https://datatracker.ietf.org/doc/html/rfc5936#section-2.2.1
-        // 2.2.1: Header Values
-        //
-        // "These are the DNS message header values for AXFR responses.
-        //
-        //     ID          MUST be copied from request -- see Note a)
-        //
-        //     QR          MUST be 1 (Response)
-        //
-        //     OPCODE      MUST be 0 (Standard Query)
-        //
-        //     Flags:
-        //        AA       normally 1 -- see Note b)
-        //        TC       MUST be 0 (Not truncated)
-        //        RD       RECOMMENDED: copy request's value; MAY be set to 0
-        //        RA       SHOULD be 0 -- see Note c)
-        //        Z        "mbz" -- see Note d)
-        //        AD       "mbz" -- see Note d)
-        //        CD       "mbz" -- see Note d)"
-        let header = additional.header_mut();
-
-        // Note: MandatoryMiddlewareSvc will also "fix" ID and QR, so strictly
-        // speaking this isn't necessary, but as a caller might not use
-        // MandatoryMiddlewareSvc we do it anyway to try harder to conform to
-        // the RFC.
-        header.set_id(msg.header().id());
-        header.set_qr(true);
-
-        header.set_opcode(Opcode::QUERY);
-        header.set_aa(true);
-        header.set_tc(false);
-        header.set_rd(msg.header().rd());
-        header.set_ra(false);
-        header.set_z(false);
-        header.set_ad(false);
-        header.set_cd(false);
     }
 
     fn to_stream(
@@ -1222,258 +989,19 @@ where
 
         None
     }
-}
 
-//--- Service (with TSIG key name in the request metadata)
-
-impl<RequestOctets, NextSvc, KS, CF> Service<RequestOctets, Option<KeyName>>
-    for XfrMiddlewareSvc<RequestOctets, NextSvc, KS, CF>
-where
-    RequestOctets: Octets + Send + Sync + Unpin + 'static,
-    for<'a> <RequestOctets as octseq::Octets>::Range<'a>: Send + Sync,
-    NextSvc: Service<RequestOctets, ()> + Clone + Send + Sync + 'static,
-    NextSvc::Future: Send + Sync + Unpin,
-    NextSvc::Target: Composer + Default + Send + Sync,
-    NextSvc::Stream: Send + Sync,
-    KS: Default + Deref + Send + Sync + 'static,
-    KS::Target: KeyStore,
-    CF: ConnectionFactory + Send + Sync + 'static,
-{
-    type Target = NextSvc::Target;
-    type Stream = XfrMiddlewareStream<
-        NextSvc::Future,
-        NextSvc::Stream,
-        <NextSvc::Stream as Stream>::Item,
-    >;
-    type Future = Pin<Box<dyn Future<Output = Self::Stream> + Send + Sync>>;
-
-    fn call(
-        &self,
-        request: Request<RequestOctets, Option<KeyName>>,
-    ) -> Self::Future {
-        let request = request.clone();
-        let next_svc = self.next_svc.clone();
-        let catalog = self.catalog.clone();
-        let zone_walking_semaphore = self.zone_walking_semaphore.clone();
-        let batcher_semaphore = self.batcher_semaphore.clone();
-        let xfr_mode = self.xfr_mode;
-        Box::pin(async move {
-            match Self::preprocess(
-                zone_walking_semaphore,
-                batcher_semaphore,
-                &request,
-                catalog,
-                xfr_mode,
-                |req| req.metadata().as_ref(),
-            )
-            .await
-            {
-                ControlFlow::Continue(()) => {
-                    let request = request.with_new_metadata(());
-                    let stream = next_svc.call(request).await;
-                    MiddlewareStream::IdentityStream(stream)
-                }
-                ControlFlow::Break(stream) => stream,
+    fn calc_msg_bytes_available<T>(req: &Request<RequestOctets, T>) -> usize {
+        let bytes_available = match req.transport_ctx() {
+            TransportSpecificContext::Udp(ctx) => {
+                let max_msg_size =
+                    ctx.max_response_size_hint().unwrap_or(512);
+                max_msg_size - req.num_reserved_bytes()
             }
-        })
-    }
-}
-
-//--- Service (without TSIG key name in the request metadata)
-
-impl<RequestOctets, NextSvc, KS, CF> Service<RequestOctets, ()>
-    for XfrMiddlewareSvc<RequestOctets, NextSvc, KS, CF>
-where
-    RequestOctets: Octets + Send + Sync + Unpin + 'static,
-    for<'a> <RequestOctets as octseq::Octets>::Range<'a>: Send + Sync,
-    NextSvc: Service<RequestOctets, ()> + Clone + Send + Sync + 'static,
-    NextSvc::Future: Send + Sync + Unpin,
-    NextSvc::Target: Composer + Default + Send + Sync,
-    NextSvc::Stream: Send + Sync,
-    KS: Default + Deref + Send + Sync + 'static,
-    KS::Target: KeyStore,
-    CF: ConnectionFactory + Send + Sync + 'static,
-{
-    type Target = NextSvc::Target;
-    type Stream = XfrMiddlewareStream<
-        NextSvc::Future,
-        NextSvc::Stream,
-        <NextSvc::Stream as Stream>::Item,
-    >;
-    type Future = Pin<Box<dyn Future<Output = Self::Stream> + Send + Sync>>;
-
-    fn call(&self, request: Request<RequestOctets, ()>) -> Self::Future {
-        let request = request.clone();
-        let next_svc = self.next_svc.clone();
-        let catalog = self.catalog.clone();
-        let zone_walking_semaphore = self.zone_walking_semaphore.clone();
-        let batcher_semaphore = self.batcher_semaphore.clone();
-        let xfr_mode = self.xfr_mode;
-        Box::pin(async move {
-            match Self::preprocess(
-                zone_walking_semaphore,
-                batcher_semaphore,
-                &request,
-                catalog,
-                xfr_mode,
-                |_| None,
-            )
-            .await
-            {
-                ControlFlow::Continue(()) => {
-                    let request = request.with_new_metadata(());
-                    let stream = next_svc.call(request).await;
-                    MiddlewareStream::IdentityStream(stream)
-                }
-                ControlFlow::Break(stream) => stream,
+            TransportSpecificContext::NonUdp(_) => {
+                65535 - req.num_reserved_bytes()
             }
-        })
+        };
+
+        bytes_available as usize
     }
-}
-
-//----------- PushResult ------------------------------------------------------
-
-enum PushResult<Target> {
-    PushedAndReadyForMore,
-    PushedAndLimitReached(AnswerBuilder<StreamTarget<Target>>),
-    NotPushedMessageFull(AnswerBuilder<StreamTarget<Target>>),
-    Retry,
-}
-
-//----------- RrBatcher -------------------------------------------------------
-
-// IDEA: Maybe this should act like an iterator and whenever it runs out of
-// items to process one should feed it more? And pass it RRsets instead of
-// Records.
-
-struct RrBatcher<RequestOctets, Target> {
-    req_msg: Arc<Message<RequestOctets>>,
-    hard_rr_limit: Option<u16>,
-    soft_byte_limit: Option<usize>,
-    answer: Option<Result<AnswerBuilder<StreamTarget<Target>>, PushError>>,
-    #[allow(clippy::type_complexity)]
-    cb: Option<
-        Box<
-            dyn Fn(AnswerBuilder<StreamTarget<Target>>) -> Result<(), ()>
-                + Send,
-        >,
-    >,
-}
-
-impl<RequestOctets, Target> RrBatcher<RequestOctets, Target>
-where
-    RequestOctets: Octets,
-    Target: Composer + Default,
-{
-    pub fn new(req_msg: Arc<Message<RequestOctets>>) -> Self {
-        Self {
-            req_msg,
-            hard_rr_limit: None,
-            soft_byte_limit: None,
-            answer: None,
-            cb: None,
-        }
-    }
-
-    pub fn set_hard_rr_limit(&mut self, rr_limit: u16) {
-        self.hard_rr_limit = Some(rr_limit);
-    }
-
-    pub fn set_soft_byte_limit(&mut self, byte_limit: u16) {
-        trace!("Setting soft byte limit to {byte_limit} bytes");
-        self.soft_byte_limit = Some(byte_limit as usize);
-    }
-
-    #[allow(clippy::type_complexity)]
-    pub fn set_cb(
-        &mut self,
-        cb: Box<
-            dyn Fn(AnswerBuilder<StreamTarget<Target>>) -> Result<(), ()>
-                + Send,
-        >,
-    ) {
-        self.cb = Some(cb);
-    }
-
-    pub fn push(
-        &mut self,
-        record: impl ComposeRecord,
-    ) -> Result<PushResult<Target>, PushError> {
-        self.answer.get_or_insert_with(|| {
-            let mut builder = mk_builder_for_target();
-            if let Some(limit) = self.soft_byte_limit {
-                builder.set_push_limit(limit);
-            }
-            builder.start_answer(&self.req_msg, Rcode::NOERROR)
-        });
-
-        let mut answer = self.answer.take().unwrap()?;
-
-        let res = answer.push(record);
-        let ancount = answer.counts().ancount();
-        // let msg_len = answer.as_slice().len() as u16;
-
-        match res {
-            Ok(()) if Some(ancount) == self.hard_rr_limit => {
-                // Push succeeded but the message is as full as the caller
-                // allows, pass it back to the caller to process.
-                Ok(PushResult::PushedAndLimitReached(answer))
-            }
-
-            // Ok(())
-            //     if self.soft_byte_limit.is_some()
-            //         && Some(msg_len) >= self.soft_byte_limit =>
-            // {
-            //     // Push succeeded but the message is as full as the caller
-            //     // allows, pass it back to the caller to process.
-            //     Ok(PushResult::PushedAndLimitReached(answer))
-            // }
-            Err(_) if ancount > 0 => {
-                // Push failed because the message is full, pass it back to
-                // the caller to process.
-                Ok(PushResult::NotPushedMessageFull(answer))
-            }
-
-            Err(err) => {
-                // We expect to be able to add at least one answer to the message.
-                Err(err)
-            }
-
-            Ok(()) => {
-                // Record has been added, keep the answer builder for the next push.
-                self.answer = Some(Ok(answer));
-                Ok(PushResult::PushedAndReadyForMore)
-            }
-        }
-    }
-
-    pub fn push_with_cb(
-        &mut self,
-        record: impl ComposeRecord,
-    ) -> Result<PushResult<Target>, ()> {
-        match self.push(record) {
-            Ok(PushResult::PushedAndLimitReached(builder)) => {
-                (self.cb.as_ref().unwrap())(builder)?;
-                Ok(PushResult::PushedAndReadyForMore)
-            }
-            Ok(PushResult::NotPushedMessageFull(builder)) => {
-                (self.cb.as_ref().unwrap())(builder)?;
-                Ok(PushResult::Retry)
-            }
-            Ok(PushResult::Retry) => unreachable!(),
-            res => res.map_err(|_| ()),
-        }
-    }
-
-    pub fn take(&mut self) -> Option<AnswerBuilder<StreamTarget<Target>>> {
-        self.answer.take().and_then(|res| res.ok())
-    }
-}
-
-//------------ IxfrResult -----------------------------------------------------
-
-enum IxfrResult<Stream> {
-    Ok(Stream),
-    FallbackToAxfr,
-    Err(OptRcode),
 }

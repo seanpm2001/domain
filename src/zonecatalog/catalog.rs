@@ -5,6 +5,7 @@
 // reading: https://kb.isc.org/docs/axfr-style-ixfr-explained
 use core::any::Any;
 use core::fmt::Debug;
+use core::future::ready;
 use core::marker::Send;
 use core::ops::{Deref, DerefMut};
 use core::pin::Pin;
@@ -14,17 +15,19 @@ use core::time::Duration;
 use std::boxed::Box;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::string::{String, ToString};
 use std::sync::Arc;
 use std::vec::Vec;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use futures::stream::FuturesUnordered;
+use octseq::Octets;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
@@ -33,7 +36,6 @@ use tokio_stream::StreamExt;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::base::iana::{Class, Opcode, OptRcode};
-use crate::base::name::{Label, ToLabelIter};
 use crate::base::net::IpAddr;
 use crate::base::{
     Message, MessageBuilder, Name, Rtype, Serial, ToName, Ttl,
@@ -59,9 +61,6 @@ use super::types::{
     ZoneConfig, ZoneDiffs, ZoneInfo, ZoneRefreshCause, ZoneRefreshInstant,
     ZoneRefreshState, ZoneRefreshTimer, ZoneReport, IANA_DNS_PORT_NUMBER,
 };
-use octseq::Octets;
-use std::fmt::Display;
-use std::string::String;
 
 //------------ ConnectionFactory ---------------------------------------------
 
@@ -199,21 +198,12 @@ where
     }
 }
 
-impl<KS, CF: ConnectionFactory> Catalog<KS, CF>
-where
-    KS: Clone + Deref,
-    KS::Target: KeyStore,
-{
-    pub fn key_store(&self) -> KS {
-        self.config.load().key_store.clone()
-    }
-}
-
 impl<KS, CF> Catalog<KS, CF>
 where
-    KS: Default + Deref + Send + Sync + 'static,
+    KS: Deref + Send + Sync + 'static,
     KS::Target: KeyStore,
-    <KS::Target as KeyStore>::Key: Clone + Debug + Sync + Send + 'static,
+    <KS::Target as KeyStore>::Key:
+        Clone + Debug + Display + Sync + Send + 'static,
     CF: ConnectionFactory + Send + Sync + 'static,
 {
     pub async fn run(&self) {
@@ -527,88 +517,15 @@ where
         self.update_lodaded_arc();
         Ok(())
     }
+}
 
-    pub async fn notify_zone_changed(
-        &self,
-        class: Class,
-        apex_name: &StoredName,
-        source: IpAddr,
-    ) -> Result<(), CatalogError> {
-        if !self.running.load(Ordering::SeqCst) {
-            return Err(CatalogError::NotRunning);
-        }
-
-        if self.zones().get_zone(apex_name, class).is_none() {
-            let key = (apex_name.clone(), class);
-            if !self.pending_zones.read().await.contains_key(&key) {
-                return Err(CatalogError::UnknownZone);
-            }
-        }
-
-        // https://datatracker.ietf.org/doc/html/rfc1996#section-2
-        //   "2.1. The following definitions are used in this document:
-        //    ...
-        //    Master          any authoritative server configured to be the
-        //                    source of zone transfer for one or more slave
-        //                    servers.
-        //
-        //    Primary Master  master server at the root of the zone transfer
-        //                    dependency graph.  The primary master is named
-        //                    in the zone's SOA MNAME field and optionally by
-        //                    an NS RR. There is by definition only one
-        //                    primary master server per zone.
-        //
-        //    Stealth         like a slave server except not listed in an NS
-        //                    RR for the zone.  A stealth server, unless
-        //                    explicitly configured to do otherwise, will set
-        //                    the AA bit in responses and be capable of acting
-        //                    as a master.  A stealth server will only be
-        //                    known by other servers if they are given static
-        //                    configuration data indicating its existence."
-
-        // https://datatracker.ietf.org/doc/html/rfc1996#section-3
-        //   "3.10. If a slave receives a NOTIFY request from a host that is
-        //    not a known master for the zone containing the QNAME, it should
-        //    ignore the request and produce an error message in its
-        //    operations log."
-
-        // From the definition in 2.1 above "known masters" are the combined
-        // set of masters and stealth masters. If we are the primary for the
-        // zone because this notification arose internally due to a local
-        // change in the zone then this check is irrelevant. Comparing the SOA
-        // MNAME or NS record value to the source IP address would require
-        // resolving the name to an IP address. Such a check would not be
-        // quick so we leave that to the running Catalog task to handle.
-
-        let msg = ZoneChangedMsg {
-            class,
-            apex_name: apex_name.clone(),
-            source: Some(source),
-        };
-
-        send_zone_changed_msg(&self.event_tx, msg)
-            .await
-            .map_err(|_| CatalogError::InternalError)?;
-
-        Ok(())
-    }
-
-    pub async fn notify_response_received(
-        &self,
-        _class: Class,
-        _apex_name: &StoredName,
-        _source: IpAddr,
-    ) {
-        // https://datatracker.ietf.org/doc/html/rfc1996
-        //   "4.8 Master Receives a NOTIFY Response from Slave
-        //
-        //    When a master server receives a NOTIFY response, it deletes this
-        //    query from the retry queue, thus completing the "notification
-        //    process" of "this" RRset change to "that" server."
-
-        // TODO
-    }
-
+impl<KS, CF> Catalog<KS, CF>
+where
+    KS: Deref + Send + Sync + 'static,
+    KS::Target: KeyStore,
+    <KS::Target as KeyStore>::Key: Clone + Debug + Sync + Send + 'static,
+    CF: ConnectionFactory + Send + Sync + 'static,
+{
     /// Get a status report for a zone.
     ///
     /// The Catalog must be [`run()`]ing for this to work.
@@ -685,9 +602,10 @@ where
 
 impl<KS, CF> Catalog<KS, CF>
 where
-    KS: Default + Deref + 'static,
+    KS: Deref + 'static,
     KS::Target: KeyStore,
-    <KS::Target as KeyStore>::Key: Clone + Debug + Sync + Send + 'static,
+    <KS::Target as KeyStore>::Key:
+        Clone + Debug + Display + Sync + Send + 'static,
     CF: ConnectionFactory + 'static,
 {
     async fn send_notify(
@@ -830,7 +748,7 @@ where
             Occupied(e) => {
                 // Zone is already managed, just return the recorded SOA
                 // REFRESH value.
-                Ok(Some(e.get().refresh))
+                Ok(Some(e.get().refresh()))
             }
         }
     }
@@ -1042,7 +960,7 @@ where
         // tuple we only have to look at the status of the zone for which the
         // notify was received.
         if matches!(
-            zone_refresh_info.status,
+            zone_refresh_info.status(),
             ZoneRefreshStatus::NotifyInProgress
         ) {
             // Note: Rather than defer the NOTIFY when one is already in
@@ -1055,7 +973,7 @@ where
             return;
         }
 
-        zone_refresh_info.status = ZoneRefreshStatus::NotifyInProgress;
+        zone_refresh_info.set_status(ZoneRefreshStatus::NotifyInProgress);
 
         let initial_xfr_addr = SocketAddr::new(source, IANA_DNS_PORT_NUMBER);
         if let Err(()) = Self::refresh_zone_and_update_state(
@@ -1093,13 +1011,14 @@ where
             | ZoneRefreshCause::SoaRefreshTimer
             | ZoneRefreshCause::SoaRefreshTimerAfterStartup
             | ZoneRefreshCause::SoaRefreshTimerAfterZoneAdded => {
-                zone_refresh_info.metrics.last_refresh_phase_started_at =
-                    Some(Instant::now());
-                zone_refresh_info.metrics.last_refresh_attempted_at =
+                zone_refresh_info
+                    .metrics_mut()
+                    .last_refresh_phase_started_at = Some(Instant::now());
+                zone_refresh_info.metrics_mut().last_refresh_attempted_at =
                     Some(Instant::now());
             }
             ZoneRefreshCause::SoaRetryTimer => {
-                zone_refresh_info.metrics.last_refresh_attempted_at =
+                zone_refresh_info.metrics_mut().last_refresh_attempted_at =
                     Some(Instant::now());
             }
         }
@@ -1124,6 +1043,7 @@ where
                     "Failed to refresh zone '{}': {err}",
                     zone.apex_name()
                 );
+
                 // https://datatracker.ietf.org/doc/html/rfc1034#section-4.3.5
                 // 4.3.5. Zone maintenance and transfers
                 //   ..
@@ -1136,61 +1056,58 @@ where
                 //    check for the EXPIRE interval, it must assume that its
                 //    copy of the zone is obsolete an discard it."
 
-                if zone_refresh_info.status == ZoneRefreshStatus::Retrying {
+                if zone_refresh_info.status() == ZoneRefreshStatus::Retrying {
                     let time_of_last_soa_check = zone_refresh_info
-                        .metrics
+                        .metrics()
                         .last_soa_serial_check_succeeded_at
-                        .unwrap_or(zone_refresh_info.metrics.zone_created_at);
+                        .unwrap_or(
+                            zone_refresh_info.metrics().zone_created_at,
+                        );
 
-                    if let Some(duration) = Instant::now()
-                        .checked_duration_since(time_of_last_soa_check)
-                    {
-                        if duration > zone_refresh_info.expire.into_duration()
-                        {
-                            let cat_zone = zone
-                                .as_ref()
-                                .as_any()
-                                .downcast_ref::<CatalogZone>()
-                                .unwrap();
+                    if zone_refresh_info.is_expired(time_of_last_soa_check) {
+                        let cat_zone = zone
+                            .as_ref()
+                            .as_any()
+                            .downcast_ref::<CatalogZone>()
+                            .unwrap();
 
-                            trace!(
-                                "Marking zone '{}' as expired",
-                                zone.apex_name()
-                            );
-                            cat_zone.mark_expired();
+                        trace!(
+                            "Marking zone '{}' as expired",
+                            zone.apex_name()
+                        );
+                        cat_zone.mark_expired();
 
-                            // TODO: Should we keep trying to refresh an
-                            // expired zone so that we can bring it back to
-                            // life if we are able to connect to the primary?
-                            //
-                            // https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#authority-zone-options
-                            // Authority Zone Options
-                            //   ...
-                            //   "If the update fetch fails, the timers in the
-                            //   SOA record are used to time another fetch
-                            //   attempt. Until the SOA expiry timer is
-                            //   reached. Then the zone is expired. When a
-                            //   zone is expired, queries are SERVFAIL, and
-                            //   any new serial number is accepted from the
-                            //   primary (even if older), and if fallback is
-                            //   enabled, the fallback activates to fetch from
-                            //   the upstream instead of the SERVFAIL."
-                            //
-                            // ^^^ Maybe we should do the same as Unbound?
+                        // TODO: Should we keep trying to refresh an
+                        // expired zone so that we can bring it back to
+                        // life if we are able to connect to the primary?
+                        //
+                        // https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#authority-zone-options
+                        // Authority Zone Options
+                        //   ...
+                        //   "If the update fetch fails, the timers in the
+                        //   SOA record are used to time another fetch
+                        //   attempt. Until the SOA expiry timer is
+                        //   reached. Then the zone is expired. When a
+                        //   zone is expired, queries are SERVFAIL, and
+                        //   any new serial number is accepted from the
+                        //   primary (even if older), and if fallback is
+                        //   enabled, the fallback activates to fetch from
+                        //   the upstream instead of the SERVFAIL."
+                        //
+                        // ^^^ Maybe we should do the same as Unbound?
 
-                            return Err(());
-                        }
+                        return Err(());
                     }
+                } else {
+                    zone_refresh_info.set_status(ZoneRefreshStatus::Retrying);
                 }
-
-                zone_refresh_info.status = ZoneRefreshStatus::Retrying;
 
                 // Schedule a zone refresh according to the SOA RETRY timer value.
                 Self::schedule_zone_refresh(
                     ZoneRefreshCause::SoaRetryTimer,
                     &event_tx,
                     key,
-                    zone_refresh_info.retry,
+                    zone_refresh_info.retry(),
                 )
                 .await;
 
@@ -1200,24 +1117,21 @@ where
             Ok(new_soa) => {
                 if let Some(new_soa) = new_soa {
                     // Refresh succeeded:
-                    zone_refresh_info.refresh = new_soa.refresh();
-                    zone_refresh_info.retry = new_soa.retry();
-                    zone_refresh_info.expire = new_soa.expire();
-                    zone_refresh_info.metrics.last_refreshed_at =
-                        Some(Instant::now());
+                    zone_refresh_info.refresh_succeeded(&new_soa);
                 } else {
-                    // No transfer was required, either because transfer is not
-                    // enabled for the zone or the zone is up-to-date.
+                    // No transfer was required, either because transfer is
+                    // not enabled at the primaries for the zone or the zone
+                    // is up-to-date with the primaries.
                 }
 
-                zone_refresh_info.status = ZoneRefreshStatus::Refreshing;
+                zone_refresh_info.set_status(ZoneRefreshStatus::Refreshing);
 
                 // Schedule a zone refresh according to the SOA REFRESH timer value.
                 Self::schedule_zone_refresh(
                     ZoneRefreshCause::SoaRefreshTimer,
                     &event_tx,
                     key,
-                    zone_refresh_info.refresh,
+                    zone_refresh_info.refresh(),
                 )
                 .await;
 
@@ -1233,18 +1147,12 @@ where
         config: Arc<ArcSwap<Config<KS, CF>>>,
     ) -> Result<Option<Soa<Name<Bytes>>>, CatalogError> {
         // Was this zone already refreshed recently?
-        if let Some(last_refreshed) =
-            zone_refresh_info.metrics.last_refreshed_at
-        {
-            if let Some(elapsed) =
-                Instant::now().checked_duration_since(last_refreshed)
-            {
-                if elapsed < MIN_DURATION_BETWEEN_ZONE_REFRESHES {
-                    // Don't refresh, we refreshed very recently
-                    debug!("Skipping refresh of zone '{}' as it was refreshed less than {}s ago ({}s)",
-                        zone.apex_name(), MIN_DURATION_BETWEEN_ZONE_REFRESHES.as_secs(), elapsed.as_secs());
-                    return Ok(None);
-                }
+        if let Some(age) = zone_refresh_info.age() {
+            if age < MIN_DURATION_BETWEEN_ZONE_REFRESHES {
+                // Don't refresh, we refreshed very recently
+                debug!("Skipping refresh of zone '{}' as it was refreshed less than {}s ago ({}s)",
+                    zone.apex_name(), MIN_DURATION_BETWEEN_ZONE_REFRESHES.as_secs(), age.as_secs());
+                return Ok(None);
             }
         }
 
@@ -1273,7 +1181,7 @@ where
         // primary should be accepted.
         let soa = Self::read_soa(&zone.read(), zone.apex_name().clone())
             .await
-            .map_err(|_out_of_zone_err| CatalogError::InternalError)?;
+            .map_err(|_out_of_zone_err| CatalogError::InternalError("Unable to read SOA for zone when checking if zone refresh is needed"))?;
 
         let current_serial = soa.map(|(soa, _)| soa.serial());
 
@@ -1308,7 +1216,7 @@ where
                         num_ok_primaries += 1;
                     }
                     Err(err) => {
-                        // Transfer failed. This shuold already have been
+                        // Transfer failed. This should already have been
                         // logged along with more details about the transfer
                         // than we have here. Try the next primary.
                         saved_err = Some(err);
@@ -1395,9 +1303,12 @@ where
             // Query the SOA serial of the primary via the chosen transport.
             let Some(client) = loaded_config
                 .conn_factory
-                .get(primary_addr, transport, key)
+                .get(primary_addr, transport, key.clone())
                 .await
-                .map_err(|_| CatalogError::InternalError)?
+                .map_err(|err| {
+                    let key = key.map(|key| format!("{key}")).unwrap_or("NOKEY".to_string());
+                    CatalogError::ConnectionError(format!("Connecting to {primary_addr} via {transport} with key '{key}' failed: {err}"))
+                })?
             else {
                 return Ok(None);
             };
@@ -1409,41 +1320,46 @@ where
             let send_request = &mut client.send_request(req);
             let msg = send_request.get_response().await?;
 
-            let newer_data_available = Self::check_primary_soa_serial(
-                msg,
-                zone_refresh_info,
-                current_serial,
-            )
-            .await?;
+            let primary_soa_serial =
+                Self::extract_response_soa_serial(msg).await?;
+
+            let newer_data_available = current_serial
+                .map(|v| primary_soa_serial > v)
+                .unwrap_or(true);
+
+            debug!("Current: {current_serial:?}");
+            debug!("Primary: {primary_soa_serial}");
+            debug!("Newer data available: {newer_data_available}");
 
             if !newer_data_available {
+                zone_refresh_info.soa_serial_check_succeeded(None);
                 return Ok(None);
+            } else {
+                zone_refresh_info
+                    .soa_serial_check_succeeded(Some(primary_soa_serial));
             }
 
             trace!(
                 "Refreshing zone '{}' by {rtype} from {primary_addr}",
                 zone.apex_name()
             );
-            let res = Self::do_xfr(
-                client,
-                zone,
-                primary_addr,
-                rtype,
-                zone_refresh_info,
-            )
-            .await;
+            let res = Self::do_xfr(client, zone, primary_addr, rtype).await;
 
-            if rtype == Rtype::IXFR
-                && matches!(
-                    res,
-                    Err(CatalogError::ResponseError(OptRcode::NOTIMP))
-                )
-            {
-                trace!("Primary {primary_addr} doesn't support IXFR");
-                continue;
+            match res {
+                Err(CatalogError::ResponseError(OptRcode::NOTIMP))
+                    if rtype == Rtype::IXFR =>
+                {
+                    trace!("Primary {primary_addr} doesn't support IXFR");
+                    continue;
+                }
+
+                Ok(new_soa) => {
+                    zone_refresh_info.refresh_succeeded(&new_soa);
+                    return Ok(Some(new_soa));
+                }
+
+                Err(err) => return Err(err),
             }
-
-            return res;
         }
 
         Ok(None)
@@ -1453,37 +1369,15 @@ where
     ///
     /// Returns Ok(true) if so, Ok(false) if its serial is equal or older, or
     /// Err if the response message indicated an error.
-    async fn check_primary_soa_serial(
+    async fn extract_response_soa_serial(
         msg: Message<Bytes>,
-        zone_refresh_info: &mut ZoneRefreshState,
-        current_serial: Option<Serial>,
-    ) -> Result<bool, CatalogError> {
+    ) -> Result<Serial, CatalogError> {
         if msg.no_error() {
             if let Ok(answer) = msg.answer() {
                 let mut records = answer.limit_to::<Soa<_>>();
                 let record = records.next();
                 if let Some(Ok(record)) = record {
-                    let serial_at_primary = record.data().serial();
-
-                    zone_refresh_info
-                        .metrics
-                        .last_soa_serial_check_succeeded_at =
-                        Some(Instant::now());
-
-                    zone_refresh_info.metrics.last_soa_serial_check_serial =
-                        Some(serial_at_primary);
-
-                    // The serial at the primary can't be stale
-                    // compared to ours if we don't have a serial yet.
-                    let newer_data_available = current_serial
-                        .map(|current| current < serial_at_primary)
-                        .unwrap_or(true);
-
-                    debug!("Current: {current_serial:?}");
-                    debug!("Primary: {serial_at_primary:?}");
-                    debug!("Newer data available: {newer_data_available}");
-
-                    return Ok(newer_data_available);
+                    return Ok(record.data().serial());
                 }
             }
         }
@@ -1496,8 +1390,7 @@ where
         zone: &Zone,
         primary_addr: SocketAddr,
         xfr_type: Rtype,
-        zone_refresh_info: &mut ZoneRefreshState,
-    ) -> Result<Option<Soa<Name<Bytes>>>, CatalogError>
+    ) -> Result<Soa<Name<Bytes>>, CatalogError>
     where
         T: SendRequest<RequestMessage<Vec<u8>>> + Send + Sync + 'static,
     {
@@ -1518,10 +1411,12 @@ where
                 Self::read_soa(&read, zone.apex_name().clone()).await
             else {
                 trace!(
-                    "Internal error - missing SA for zone '{}'",
+                    "Internal error - missing SOA for zone '{}'",
                     zone.apex_name()
                 );
-                return Err(CatalogError::InternalError);
+                return Err(CatalogError::InternalError(
+                    "Unable to read SOA for zone when preparing for IXFR in",
+                ));
             };
             msg.push((zone.apex_name(), ttl, soa)).unwrap();
             msg
@@ -1534,39 +1429,36 @@ where
 
         let client =
             net::client::xfr::Connection::new(Some(zone.clone()), client);
-        let msg = client.send_request(req).get_response().await?;
 
-        if msg.is_error() {
-            return Err(CatalogError::ResponseError(msg.opt_rcode()));
+        let mut send_request = client.send_request(req);
+
+        while !send_request.is_stream_complete() {
+            let msg = send_request
+                .get_response()
+                .await
+                .map_err(CatalogError::RequestError)?;
+
+            if msg.is_error() {
+                return Err(CatalogError::ResponseError(msg.opt_rcode()));
+            }
         }
 
         let soa_and_ttl =
             Self::read_soa(&zone.read(), zone.apex_name().clone())
                 .await
-                .map_err(|_out_of_zone_err| CatalogError::InternalError)?;
+                .map_err(|_out_of_zone_err| {
+                    CatalogError::InternalError(
+                        "Unable to read SOA for zone post XFR in",
+                    )
+                })?;
 
         let Some((soa, _ttl)) = soa_and_ttl else {
-            return Err(CatalogError::InternalError);
+            return Err(CatalogError::InternalError(
+                "SOA for zone missing post XFR in",
+            ));
         };
 
-        zone_refresh_info.metrics.last_refresh_succeeded_serial =
-            Some(soa.serial());
-        Ok(Some(soa))
-    }
-
-    pub fn mk_relative_name_iterator<'l>(
-        apex_name: &Name<Bytes>,
-        qname: &'l impl ToName,
-    ) -> Result<impl Iterator<Item = &'l Label> + Clone, OutOfZone> {
-        let mut qname = qname.iter_labels().rev();
-        for apex_label in apex_name.iter_labels().rev() {
-            let qname_label = qname.next();
-            if Some(apex_label) != qname_label {
-                error!("Qname is not in zone '{apex_name}'");
-                return Err(OutOfZone);
-            }
-        }
-        Ok(qname)
+        Ok(soa)
     }
 
     #[allow(clippy::borrowed_box)]
@@ -1809,26 +1701,129 @@ where
     }
 }
 
-impl<KS, CF: ConnectionFactory> Catalog<KS, CF>
+//--- Notifiable
+
+impl<KS, CF> Notifiable for Catalog<KS, CF>
 where
-    KS: Default + Deref,
+    KS: Deref + Send + Sync + 'static,
+    KS::Target: KeyStore,
+    CF: ConnectionFactory + Send + Sync + 'static,
+{
+    #[allow(clippy::manual_async_fn)]
+    fn notify_zone_changed(
+        &self,
+        class: Class,
+        apex_name: &StoredName,
+        source: IpAddr,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<(), NotifyError>> + Sync + Send + '_>,
+    > {
+        let apex_name = apex_name.clone();
+        Box::pin(async move {
+            if !self.running.load(Ordering::SeqCst) {
+                return Err(NotifyError::NotReady);
+            }
+
+            if self.zones().get_zone(&apex_name, class).is_none() {
+                let key = (apex_name.clone(), class);
+                if !self.pending_zones.read().await.contains_key(&key) {
+                    return Err(NotifyError::UnknownZone);
+                }
+            }
+
+            // https://datatracker.ietf.org/doc/html/rfc1996#section-2
+            //   "2.1. The following definitions are used in this document:
+            //    ...
+            //    Master          any authoritative server configured to be the
+            //                    source of zone transfer for one or more slave
+            //                    servers.
+            //
+            //    Primary Master  master server at the root of the zone transfer
+            //                    dependency graph.  The primary master is named
+            //                    in the zone's SOA MNAME field and optionally by
+            //                    an NS RR. There is by definition only one
+            //                    primary master server per zone.
+            //
+            //    Stealth         like a slave server except not listed in an NS
+            //                    RR for the zone.  A stealth server, unless
+            //                    explicitly configured to do otherwise, will set
+            //                    the AA bit in responses and be capable of acting
+            //                    as a master.  A stealth server will only be
+            //                    known by other servers if they are given static
+            //                    configuration data indicating its existence."
+
+            // https://datatracker.ietf.org/doc/html/rfc1996#section-3
+            //   "3.10. If a slave receives a NOTIFY request from a host that is
+            //    not a known master for the zone containing the QNAME, it should
+            //    ignore the request and produce an error message in its
+            //    operations log."
+
+            // From the definition in 2.1 above "known masters" are the combined
+            // set of masters and stealth masters. If we are the primary for the
+            // zone because this notification arose internally due to a local
+            // change in the zone then this check is irrelevant. Comparing the SOA
+            // MNAME or NS record value to the source IP address would require
+            // resolving the name to an IP address. Such a check would not be
+            // quick so we leave that to the running Catalog task to handle.
+
+            let msg = ZoneChangedMsg {
+                class,
+                apex_name: apex_name.clone(),
+                source: Some(source),
+            };
+
+            self.event_tx.send(Event::ZoneChanged(msg)).await.map_err(
+                |err| NotifyError::Failed(format!("Internal error: {err}")),
+            )?;
+
+            Ok(())
+        })
+    }
+
+    fn notify_response_received(
+        &self,
+        _class: Class,
+        _apex_name: &StoredName,
+        _source: IpAddr,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<(), NotifyError>> + Sync + Send + '_>,
+    > {
+        // https://datatracker.ietf.org/doc/html/rfc1996
+        //   "4.8 Master Receives a NOTIFY Response from Slave
+        //
+        //    When a master server receives a NOTIFY response, it deletes this
+        //    query from the retry queue, thus completing the "notification
+        //    process" of "this" RRset change to "that" server."
+
+        // TODO
+        Box::pin(ready(Ok(())))
+    }
+}
+
+impl<KS, CF: ConnectionFactory> ZoneLookup for Catalog<KS, CF>
+where
+    KS: Deref,
     KS::Target: KeyStore,
 {
     /// The entire tree of zones managed by this [`Catalog`] instance.
-    pub fn zones(&self) -> Arc<ZoneTree> {
+    fn zones(&self) -> Arc<ZoneTree> {
         self.loaded_arc.read().unwrap().clone()
     }
 
     /// The set of "active" zones managed by this [`Catalog`] instance.
     ///
-    /// Excludes:
-    ///   - Newly added empty secondary zones still pending initial refresh.
-    ///   - Expired zones.
-    pub fn get_zone(
+    /// Attempting to get a newly added empty secondary zone that is still
+    /// pending initial refresh or an expired zone will result in an error.
+    /// This allows the caller to distinguish between the catalog not being
+    /// authoratitive for a zone (Ok(None)) (thus the response should be
+    /// NOTAUTH), a zone for which the catalog is authoritative but is
+    /// temporarily not in the correct state (SERVFAIL) vs a zone for which
+    /// the catalog is authoritative and which is in the correct state (Ok).
+    fn get_zone(
         &self,
         apex_name: &impl ToName,
         class: Class,
-    ) -> Option<Zone> {
+    ) -> Result<Option<Zone>, ZoneError> {
         let zones = self.zones();
 
         if let Some(zone) = zones.get_zone(apex_name, class) {
@@ -1839,24 +1834,24 @@ where
                 .unwrap();
 
             if cat_zone.is_active() {
-                return Some(zone.clone());
+                return Ok(Some(zone.clone()));
+            } else {
+                return Err(ZoneError::TemporarilyUnavailable);
             }
         }
 
-        None
+        Ok(None)
     }
 
     /// Gets the closest matching "active" [`Zone`] for the given QNAME and
     /// CLASS, if any.
     ///
-    /// Excludes:
-    ///   - Newly added empty secondary zones still pending initial refresh.
-    ///   - Expired zones.
-    pub fn find_zone(
+    /// Returns the same result as [get_zone()].
+    fn find_zone(
         &self,
         qname: &impl ToName,
         class: Class,
-    ) -> Option<Zone> {
+    ) -> Result<Option<Zone>, ZoneError> {
         let zones = self.zones();
 
         if let Some(zone) = zones.find_zone(qname, class) {
@@ -1867,29 +1862,24 @@ where
                 .unwrap();
 
             if cat_zone.is_active() {
-                return Some(zone.clone());
+                return Ok(Some(zone.clone()));
+            } else {
+                return Err(ZoneError::TemporarilyUnavailable);
             }
         }
 
-        None
+        Ok(None)
     }
 }
 
 impl<KS, CF: ConnectionFactory> Catalog<KS, CF>
 where
-    KS: Default + Deref,
+    KS: Deref,
     KS::Target: KeyStore,
 {
     fn update_lodaded_arc(&self) {
         *self.loaded_arc.write().unwrap() = self.member_zones.load_full();
     }
-}
-
-async fn send_zone_changed_msg(
-    tx: &Sender<Event>,
-    msg: ZoneChangedMsg,
-) -> Result<(), SendError<Event>> {
-    tx.send(Event::ZoneChanged(msg)).await
 }
 
 /// Create a [`Catalog`] from an RFC 9432 catalog zone.
@@ -1915,7 +1905,7 @@ async fn send_zone_changed_msg(
 
 //------------ TypedZone -----------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct TypedZone {
     store: Arc<dyn ZoneStore>,
     zone_type: ZoneConfig,
@@ -2087,7 +2077,7 @@ impl WritableZone for WritableCatalogZone {
                         source: None,
                     };
 
-                    send_zone_changed_msg(&notify_tx, msg).await.unwrap();
+                    notify_tx.send(Event::ZoneChanged(msg)).await.unwrap(); // TODO
 
                     Ok(diff)
                 }
@@ -2102,11 +2092,12 @@ impl WritableZone for WritableCatalogZone {
 #[derive(Debug)]
 pub enum CatalogError {
     NotRunning,
-    InternalError,
+    InternalError(&'static str),
     UnknownZone,
     RequestError(request::Error),
     ResponseError(OptRcode),
     IoError(io::Error),
+    ConnectionError(String),
 }
 
 //--- Display
@@ -2115,19 +2106,22 @@ impl Display for CatalogError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             CatalogError::NotRunning => f.write_str("Catalog not running"),
-            CatalogError::InternalError => {
-                f.write_str("Internal Catalog error")
+            CatalogError::InternalError(err) => {
+                f.write_fmt(format_args!("Internal error: {err}"))
             }
             CatalogError::UnknownZone => f.write_str("Unknown zone"),
             CatalogError::RequestError(err) => f.write_fmt(format_args!(
-                "Request sent by Catalog failed: {err}"
+                "Error while sending request: {err}"
             )),
             CatalogError::ResponseError(err) => f.write_fmt(format_args!(
-                "Error response received by Catalog: {err}"
+                "Error while receiving response: {err}"
             )),
-            CatalogError::IoError(err) => f.write_fmt(format_args!(
-                "I/O error during Catalog operation: {err}"
-            )),
+            CatalogError::IoError(err) => {
+                f.write_fmt(format_args!("I/O error: {err}"))
+            }
+            CatalogError::ConnectionError(err) => {
+                f.write_fmt(format_args!("Unable to connect: {err}"))
+            }
         }
     }
 }
@@ -2187,6 +2181,8 @@ impl From<io::Error> for CatalogError {
 
 #[derive(Clone, Default)]
 pub struct DefaultConnFactory;
+
+//--- ConnectionFactory
 
 impl ConnectionFactory for DefaultConnFactory {
     type Error = String;
@@ -2252,8 +2248,7 @@ impl ConnectionFactory for DefaultConnFactory {
                         .set_response_timeout(Duration::from_secs(2));
                     // Allow time between the SOA query response and sending the
                     // AXFR/IXFR request.
-                    stream_config
-                        .set_initial_idle_timeout(Duration::from_secs(5));
+                    stream_config.set_idle_timeout(Duration::from_secs(5));
                     // Allow much more time for an XFR streaming response.
                     stream_config.set_streaming_response_timeout(
                         Duration::from_secs(30),
@@ -2290,113 +2285,6 @@ impl ConnectionFactory for DefaultConnFactory {
     }
 }
 
-// #[derive(Default)]
-// pub struct ConnFactory {
-//     #[cfg(test)]
-//     test_channel: Option<ClientServerChannel>,
-// }
-
-// impl std::fmt::Debug for ConnFactory {
-//     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-//         f.debug_struct("ConnFactory").finish()
-//     }
-// }
-
-// impl ConnFactory {
-//     async fn get<K>(
-//         &self,
-//         dest: SocketAddr,
-//         strategy: &TransportStrategy,
-//         key: Option<K>,
-//     ) -> Result<Option<Conn<RequestMessage<Vec<u8>>, K>>, std::io::Error>
-//     where
-//         K: Clone + Debug + AsRef<Key> + Send + Sync + 'static,
-//     {
-//         match strategy {
-//             TransportStrategy::None => Ok(None),
-
-//             TransportStrategy::Udp => {
-//                 let mut dgram_config = dgram::Config::new();
-//                 dgram_config.set_max_parallel(1);
-//                 dgram_config.set_read_timeout(Duration::from_millis(1000));
-//                 dgram_config.set_max_retries(1);
-//                 dgram_config.set_udp_payload_size(Some(1400));
-
-//                 #[cfg(test)]
-//                 {
-//                     let client = dgram::Connection::with_config(
-//                         self.test_channel.unwrap().new_client(None),
-//                         dgram_config,
-//                     );
-//                     Ok(Some(Conn::Udp(net::client::tsig::Connection::new(
-//                         key, client,
-//                     ))))
-//                 }
-
-//                 #[cfg(not(test))]
-//                 {
-//                     let client = dgram::Connection::with_config(
-//                         UdpConnect::new(dest),
-//                         dgram_config,
-//                     );
-//                     Ok(Some(Conn::Udp(net::client::tsig::Connection::new(
-//                         key, client,
-//                     ))))
-//                 }
-//             }
-
-//             TransportStrategy::Tcp => {
-//                 let mut stream_config = net::client::stream::Config::new();
-//                 stream_config.set_response_timeout(Duration::from_secs(2));
-//                 // Allow time between the SOA query response and sending the
-//                 // AXFR/IXFR request.
-//                 stream_config
-//                     .set_initial_idle_timeout(Duration::from_secs(5));
-//                 // Allow much more time for an XFR streaming response.
-//                 stream_config
-//                     .set_streaming_response_timeout(Duration::from_secs(30));
-
-//                 #[cfg(test)]
-//                 let (client, transport) = {
-//                     net::client::stream::Connection::with_config(
-//                         self.test_channel.unwrap().connect(None),
-//                         stream_config,
-//                     )
-//                 };
-
-//                 #[cfg(not(test))]
-//                 let (client, transport) = {
-//                     let tcp_stream = TcpStream::connect(dest).await?;
-//                     net::client::stream::Connection::with_config(
-//                         tcp_stream,
-//                         stream_config,
-//                     )
-//                 };
-
-//                 tokio::spawn(async move {
-//                     transport.run().await;
-//                     trace!("TCP connection terminated");
-//                 });
-
-//                 Ok(Some(Conn::Tcp(net::client::tsig::Connection::new(
-//                     key, client,
-//                 ))))
-//             }
-//         }
-//     }
-// }
-
-// fn mk_xfr_tcp_client_cfg() -> net::client::stream::Config {
-//     let mut stream_config = net::client::stream::Config::new();
-//     stream_config.set_response_timeout(Duration::from_secs(2));
-//     // Allow time between the SOA query response and sending the
-//     // AXFR/IXFR request.
-//     stream_config.set_initial_idle_timeout(Duration::from_secs(5));
-//     // Allow much more time for an XFR streaming response.
-//     stream_config.set_streaming_response_timeout(Duration::from_secs(30));
-//     stream_config
-// }
-
 impl<T: SendRequest<RequestMessage<Octs>> + ?Sized, Octs: Octets>
     SendRequest<RequestMessage<Octs>> for Box<T>
 {
@@ -2406,4 +2294,106 @@ impl<T: SendRequest<RequestMessage<Octs>> + ?Sized, Octs: Octets>
     ) -> Box<dyn request::GetResponse + Send + Sync> {
         (**self).send_request(request_msg)
     }
+}
+
+//------------ Notifiable -----------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NotifyError {
+    NotReady,
+    UnknownZone,
+    Failed(String),
+}
+
+// Note: The fn signatures can be simplified to fn() -> impl Future<...> if
+// our MSRV is later increased.
+pub trait Notifiable {
+    fn notify_zone_changed(
+        &self,
+        class: Class,
+        apex_name: &StoredName,
+        source: IpAddr,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<(), NotifyError>> + Sync + Send + '_>,
+    >;
+
+    fn notify_response_received(
+        &self,
+        class: Class,
+        apex_name: &StoredName,
+        source: IpAddr,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<(), NotifyError>> + Sync + Send + '_>,
+    >;
+}
+
+impl<T: Notifiable> Notifiable for Arc<T> {
+    fn notify_zone_changed(
+        &self,
+        class: Class,
+        apex_name: &StoredName,
+        source: IpAddr,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<(), NotifyError>> + Sync + Send + '_>,
+    > {
+        (**self).notify_zone_changed(class, apex_name, source)
+    }
+
+    fn notify_response_received(
+        &self,
+        class: Class,
+        apex_name: &StoredName,
+        source: IpAddr,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<(), NotifyError>> + Sync + Send + '_>,
+    > {
+        (**self).notify_response_received(class, apex_name, source)
+    }
+}
+
+//------------ ZoneLookup -----------------------------------------------------
+
+pub trait ZoneLookup {
+    fn zones(&self) -> Arc<ZoneTree>;
+
+    fn get_zone(
+        &self,
+        apex_name: &impl ToName,
+        class: Class,
+    ) -> Result<Option<Zone>, ZoneError>;
+
+    fn find_zone(
+        &self,
+        qname: &impl ToName,
+        class: Class,
+    ) -> Result<Option<Zone>, ZoneError>;
+}
+
+impl<T: ZoneLookup> ZoneLookup for Arc<T> {
+    fn zones(&self) -> Arc<ZoneTree> {
+        (**self).zones()
+    }
+
+    fn get_zone(
+        &self,
+        apex_name: &impl ToName,
+        class: Class,
+    ) -> Result<Option<Zone>, ZoneError> {
+        (**self).get_zone(apex_name, class)
+    }
+
+    fn find_zone(
+        &self,
+        qname: &impl ToName,
+        class: Class,
+    ) -> Result<Option<Zone>, ZoneError> {
+        (**self).find_zone(qname, class)
+    }
+}
+
+//------------ ZoneError ------------------------------------------------------
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ZoneError {
+    TemporarilyUnavailable,
 }

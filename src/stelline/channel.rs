@@ -2,6 +2,7 @@
 // between two ends, it isn't possible to create additional client ends for a
 // single server end for example.
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use core::time::Duration;
 
 use std::boxed::Box;
 use std::collections::HashMap;
@@ -506,9 +507,10 @@ impl Future for ClientServerChannelReadableFut {
             trace!("Server socket is now readable");
             Poll::Ready(Ok(()))
         } else {
-            trace!("Server socket is not yet readable");
             let waker = cx.waker().clone();
             tokio::task::spawn(async move {
+                // Give other tasks a chance to run.
+                tokio::time::sleep(Duration::from_nanos(1)).await;
                 waker.wake();
             });
             Poll::Pending

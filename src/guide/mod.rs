@@ -1,5 +1,3 @@
-//! Getting started with the domain crate.
-//! 
 //! Welcome to the guide module.
 //! 
 //! The documentation outside this module is reference material covering in
@@ -11,5 +9,5 @@
 //! this crate offers, who it is for, and how its various pieces can be used
 //! together.
 //! 
-//! At present this guide has the following sections:
+//! This guide has the following sections:
 pub mod xfr_and_related_topics;

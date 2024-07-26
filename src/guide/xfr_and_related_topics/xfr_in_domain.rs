@@ -5,7 +5,7 @@
 //! The following diagrams illustrates which types in domain handle XFR and
 //! related functionality and how they interact.
 //! 
-//! **Component relationships:**
+//! ### Component relationships
 //! 
 //! ```text
 //!     ┌──────------┐                        
@@ -44,7 +44,7 @@
 //!     [`Catalog`].
 //! 
 //! 
-//! **Request/response handling:**
+//! ### Request/response handling
 //! 
 //! ```text
 //!                If TSIG:               If NOTIFY:               If A/IXFR:            
@@ -71,7 +71,7 @@
 //!       will NOT be propagated to the next service.
 //! 
 //! 
-//! **Catalog background activity:**
+//! ### Catalog background activity
 //! 
 //! ```text
 //! NOTIFY                          

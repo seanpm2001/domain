@@ -7,7 +7,7 @@
 //! 
 //! Many DNS related RFCs refer to the notion of primary and secondary name
 //! servers and [RFC 9499 DNS
-//! Terminology](https://datatracker.ietf.org/doc/rfc9499/) contains
+//! Terminology](https://www.rfc-editor.org/rfc/rfc9499.html) contains
 //! definitions for these terms.
 //! 
 //! In this documentation the notions of primary and secondary are a simple
@@ -47,7 +47,7 @@
 //! - [AXFR](https://datatracker.ietf.org/doc/rfc5936) (Authoritative XFR)
 //!   sends a full copy of the requested zone to requesting clients. Name
 //!   servers are required by [RFC
-//!   1034](https://datatracker.ietf.org/doc/rfc1034/) to support AXFR.
+//!   1034](https://www.rfc-editor.org/rfc/rfc1034.html) to support AXFR.
 //! 
 //! - [IXFR](https://datatracker.ietf.org/doc/rfc1995) (Incremental XFR) sends
 //!   changes to the zone to requesting clients to enable them to update their
@@ -104,10 +104,10 @@
 //! the IXFR server may attempt to reply using UDP if the entire response can
 //! be contained in a single DNS packet"_.
 //!
-//! [RFC 1034]: https://datatracker.ietf.org/doc/rfc1034/
-//! [RFC 1995]: https://datatracker.ietf.org/doc/rfc1995/
-//! [RFC 5936]: https://datatracker.ietf.org/doc/rfc5936/
-//! [RFC 9103]: https://datatracker.ietf.org/doc/rfc9103/
+//! [RFC 1034]: https://www.rfc-editor.org/rfc/rfc1034.html
+//! [RFC 1995]: https://www.rfc-editor.org/rfc/rfc1995.html
+//! [RFC 5936]: https://www.rfc-editor.org/rfc/rfc5936.html
+//! [RFC 9103]: https://www.rfc-editor.org/rfc/rfc9103.html
 //! 
 //! <div class="warning">
 //! 

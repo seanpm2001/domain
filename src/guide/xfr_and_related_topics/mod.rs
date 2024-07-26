@@ -2,7 +2,7 @@
 //! 
 //! Keeping zones up-to-date across a group of DNS name servers has its own
 //! section in one of the earliest DNS RFCs, [RFC 1034 Domain Names - Concepts
-//! and Facilities](https://datatracker.ietf.org/doc/rfc1034/):
+//! and Facilities](https://www.rfc-editor.org/rfc/rfc1034.html):
 //! 
 //! > _Part of the job of a zone administrator is to maintain the zones at all
 //! > of the name servers which are authoritative for the zone.  When the
@@ -18,10 +18,10 @@
 //! - [RFC 5936]: DNS Zone Transfer Protocol (AXFR)
 //! - [RFC 8945]: Secret Key Transaction Authentication for DNS (TSIG)
 //! 
-//! [RFC 1995]: https://datatracker.ietf.org/doc/rfc1995/
-//! [RFC 1996]: https://datatracker.ietf.org/doc/rfc1996/
-//! [RFC 5936]: https://datatracker.ietf.org/doc/rfc5936/
-//! [RFC 8945]: https://datatracker.ietf.org/doc/rfc8945/
+//! [RFC 1995]: https://www.rfc-editor.org/rfc/rfc1995.html
+//! [RFC 1996]: https://www.rfc-editor.org/rfc/rfc1996.html
+//! [RFC 5936]: https://www.rfc-editor.org/rfc/rfc5936.html
+//! [RFC 8945]: https://www.rfc-editor.org/rfc/rfc8945.html
 //! 
 //! As you might have noticed from these RFC titles, zone transfer is often
 //! referred to as XFR.
